@@ -1,0 +1,45 @@
+# ============================================================
+#  STL Viewer (Python) —— 提交忽略规则
+# ============================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# --- 测试与覆盖率 ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- 工具与编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- 运行产物与临时文件 ---
+outputs/
+*.log
+*.tmp
+*.bak
+~$*
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini

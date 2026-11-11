@@ -1,0 +1,9 @@
+# STL Viewer 的 Python 实现 —— 运行依赖
+#
+#   pip install -r requirements.txt
+#
+# 必需：数值计算与软件光栅化
+numpy>=1.22
+
+# 可选：图形界面（无它时仍可使用命令行模式）
+PyQt5>=5.15

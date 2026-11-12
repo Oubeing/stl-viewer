@@ -34,6 +34,7 @@ htmlcov/
 
 # --- 运行产物与临时文件 ---
 outputs/
+mcp_output/
 *.log
 *.tmp
 *.bak

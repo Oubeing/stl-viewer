@@ -197,13 +197,29 @@ class ScreenPicker:
         return True
 
     # ---------------- 取点 ----------------
+    def is_current(self, scene, camera) -> bool:
+        """索引是否与当前视图 / 场景一致（不重建、不阻塞）。"""
+        if not self.ready:
+            return False
+        try:
+            return self._key_for(scene, camera) == self._key
+        except Exception:
+            return False
+
     def pick(self, scene, camera, x: float, y: float, pad: float = 1.5,
              allow_build: bool = True) -> np.ndarray | None:
-        """(x, y) 像素下方的模型表面点（世界坐标）；没打中返回 None。"""
-        if not allow_build and not self.ready:
-            return None
+        """(x, y) 像素下方的模型表面点（世界坐标）；没打中返回 None。
+
+        ``allow_build=False`` 时**绝不重建索引**：只查询与当前视图匹配的
+        现成索引，过期就直接返回 None。交互路径（点击 / 悬停）一律用它，
+        这样大模型转完视角马上点击也不会在 GUI 线程里等一次全量重建；
+        重建交给后台线程提前做好。
+        """
         try:
-            if not self.ensure(scene, camera):
+            if allow_build:
+                if not self.ensure(scene, camera):
+                    return None
+            elif not self.is_current(scene, camera):
                 return None
             return self._query(camera, x, y, pad)
         except Exception:

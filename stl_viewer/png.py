@@ -31,20 +31,23 @@ def encode_png(image: np.ndarray) -> bytes:
     else:
         color_type = 6
 
-    raw = bytearray()
+    # 逐行 append 的 Python 循环在 2K/4K 图上要几十毫秒；这里一次性拼出
+    # 「每行一个 filter 字节 + 像素」的缓冲区，交给 numpy 连续写入。
     stride = w * channels
-    flat = arr.reshape(h, stride)
-    for row in flat:
-        raw.append(0)  # filter type 0 (None)
-        raw.extend(row.tobytes())
+    raw = np.zeros((h, stride + 1), dtype=np.uint8)
+    raw[:, 0] = 0                       # filter type 0 (None)
+    raw[:, 1:] = arr.reshape(h, stride)
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
         return (struct.pack(">I", len(payload)) + tag + payload +
                 struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
 
     ihdr = struct.pack(">IIBBBBB", w, h, 8, color_type, 0, 0, 0)
+    # 级别 3 与 6 都是无损 PNG，视觉完全一致；大图编码时间约减半。
+    level = 3 if (w * h) > 1_500_000 else 6
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
-            chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+            chunk(b"IDAT", zlib.compress(raw.tobytes(), level)) +
+            chunk(b"IEND", b""))
 
 
 def read_png(path: str) -> np.ndarray:

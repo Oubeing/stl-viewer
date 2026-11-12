@@ -6,7 +6,8 @@
 * 线框（边去重 + 批量采样画线，与实体共用 Z 缓冲）
 * 光照（环境光 / 漫反射 / 高光，支持双面受光 "Back and Front"）
 * 透明混合（Transparent，按深度由远及近混合）
-* 坐标轴、地面网格、十字准线、测量标注（内置 5x7 点阵字体）
+* 坐标轴（箭头与 X/Y/Z 文字始终留在画布内）、地面网格、贯穿画布的十字
+  准线、测量标注（内置 5x7 点阵字体）
 * 背景纯色 / 渐变 / 全透明（透明背景导出）
 * 超采样抗锯齿（Save Multi Res Picture）
 """
@@ -612,7 +613,12 @@ class SoftwareRenderer:
         因此重复像素由后写入的较近线段覆盖，与 Z 缓冲配合即得正确遮挡。
         """
         W, H = self.width, self.height
-        t = np.linspace(0.0, 1.0, maxn, dtype=np.float32)[None, :]
+        # 每条线按自己的采样点数归一化 t。以前整批共用 linspace(0,1,maxn)，
+        # 短线的有效样本只走到 maxn 的前 n 个，端点实际停在 n/maxn 处 ——
+        # 长短线混在一批时短的那条会被「画半截」（贯穿画布的十字准线
+        # 下半段就曾只画到 209/240 行）。
+        denom = np.maximum(n[:, None] - 1, 1).astype(np.float32)
+        t = np.arange(maxn, dtype=np.float32)[None, :] / denom
         xs = p1[:, 0][:, None] + dx[:, None] * t
         ys = p1[:, 1][:, None] + dy[:, None] * t
         zs = z1[:, None] + (z2 - z1)[:, None] * t
@@ -686,6 +692,14 @@ class SoftwareRenderer:
     def _text_scale(self) -> int:
         return 1 if self.width < 900 else 2
 
+    def _clamped_text_xy(self, x: int, y: int, text: str, ts: int) -> tuple:
+        """把标注文字的左上角收进画布；任何视角下都不让文字被边缘切掉。"""
+        tw, th = font5x7.text_size(text, ts)
+        max_x = max(self.width - tw - 1, 0)
+        max_y = max(self.height - th - 1, 0)
+        return int(np.clip(int(x), 0, max_x)), int(np.clip(int(y), 0, max_y))
+
+
     def _draw_grid(self, scene: Scene, camera: Camera, opts: RenderOptions) -> None:
         scale = _scene_scale(scene)
         step = _nice_step(scale / 10.0) * max(opts.grid_scale, 1e-6)
@@ -712,48 +726,47 @@ class SoftwareRenderer:
                 self._draw_lines(s1[flag], s2[flag], z1[flag], z2[flag], color, 1)
 
     def _draw_axes(self, scene: Scene, camera: Camera, opts: RenderOptions) -> None:
-        """坐标轴：原点位于工件坐标系零点，以叠加方式绘制。"""
+        """坐标轴：原点在工件坐标系零点；箭头与 X/Y/Z 文字始终留在画布内。
+
+        旧实现直接把世界端点投影后连线：一放大，箭头就跑到画布外，标签
+        跟着消失；支点平移后甚至整条轴都不见了。这里把每段箭头裁进
+        「预留给文字的安全矩形」，方向不变、长度自适应，任何缩放/旋转/
+        平移下三个轴和字母都完整可见。
+        """
         scale = _scene_scale(scene)
         length = scale * opts.axis_scale
-        origin = np.zeros(3)
-        view = camera.view_matrix()
-        c_origin = mu.transform_points(view, origin[None, :])
-        s_origin, z_origin, _ = camera.project_camera_space(c_origin)
-        if not np.isfinite(s_origin).all():
-            return
         ts = self._text_scale()
-        for i in range(3):
-            tip = origin.copy()
-            tip[i] += length
-            c_tip = mu.transform_points(view, tip[None, :])
-            s_tip, z_tip, _ = camera.project_camera_space(c_tip)
-            if not np.isfinite(s_tip).all():
-                continue
+        segments = axis_screen_geometry(camera, self.width, self.height,
+                                        length, ts, opts.axis_scale)
+        zero = np.zeros(1)
+        for i, p0, p1 in segments:
             color = np.asarray(AXIS_COLORS[i], dtype=np.float32)
-            self._draw_lines(s_origin, s_tip, z_origin, z_tip, color,
-                             max(2, ts), 1.0, 0.0, False)
-            d = s_tip[0] - s_origin[0]
+            self._draw_lines(p0.reshape(1, 2), p1.reshape(1, 2),
+                             zero, zero, color, max(2, ts), 1.0, 0.0, False)
+            d = p1 - p0
             norm = float(np.hypot(*d))
             if norm > 12:
                 d = d / norm
                 n = np.array([-d[1], d[0]])
                 for side in (1.0, -1.0):
-                    a = (s_tip[0] - d * 9 + n * 5 * side).reshape(1, 2)
-                    self._draw_lines(a, s_tip, z_tip, z_tip, color, max(2, ts), 1.0,
-                                     0.0, False)
+                    a = (p1 - d * 9 + n * 5 * side).reshape(1, 2)
+                    self._draw_lines(a, p1.reshape(1, 2), zero, zero, color,
+                                     max(2, ts), 1.0, 0.0, False)
             if opts.axis_labels:
-                x = int(s_tip[0][0] + 7 * ts)
-                y = int(s_tip[0][1] - 3 * ts)
+                x, y = self._clamped_text_xy(
+                    int(p1[0] + 7 * ts), int(p1[1] - 3 * ts),
+                    AXIS_NAMES[i], ts)
                 self._draw_text(x, y, AXIS_NAMES[i], color, ts)
 
     def _draw_crosshair(self, opts: RenderOptions) -> None:
+        """十字准线：水平/垂直两条线贯穿整个画布（中心留一个很小的缺口）。"""
         cx, cy = self.width / 2.0, self.height / 2.0
+        gap = 4.0
         base = np.asarray(opts.background, dtype=np.float32)
         color = np.clip(1.0 - base * 0.55, 0.2, 1.0)
-        arm = max(min(self.width, self.height) * 0.03, 10.0)
-        gap = arm * 0.28
-        segs_a = [(cx - arm, cy), (cx + gap, cy), (cx, cy - arm), (cx, cy + gap)]
-        segs_b = [(cx - gap, cy), (cx + arm, cy), (cx, cy - gap), (cx, cy + arm)]
+        segs_a = [(0.0, cy), (cx + gap, cy), (cx, 0.0), (cx, cy + gap)]
+        segs_b = [(cx - gap, cy), (float(self.width - 1), cy),
+                  (cx, cy - gap), (cx, float(self.height - 1))]
         self._draw_lines(np.array(segs_a, dtype=np.float64),
                          np.array(segs_b, dtype=np.float64),
                          np.zeros(4), np.zeros(4), color, 1, 1.0, 0.0, False)
@@ -815,8 +828,9 @@ class SoftwareRenderer:
                 anchor = np.asarray(item.label_anchor(), dtype=np.float64)[None, :]
                 scr, _, _ = camera.project(anchor)
                 if np.isfinite(scr).all():
-                    tx = int(scr[0][0] + 10 * ts)
-                    ty = int(scr[0][1] - 6 * ts)
+                    tx, ty = self._clamped_text_xy(
+                        int(scr[0][0] + 10 * ts), int(scr[0][1] - 6 * ts),
+                        label, ts)
                     self._draw_text(tx, ty, label, (1.0, 1.0, 1.0), ts)
 
     # ==================================================================
@@ -877,6 +891,84 @@ def _scene_scale(scene: Scene) -> float:
     lo, hi = scene.bounds()
     span = float(np.linalg.norm(hi - lo))
     return span if span > 1e-9 else 100.0
+
+
+def _clip_segment_to_rect(a, b, x0: float, y0: float,
+                          x1: float, y1: float):
+    """Liang-Barsky：把线段裁进安全矩形，返回两端点或 None。
+
+    放大/平移/旋转之后，坐标轴箭头的世界端点常常跑到画布外；直接绘制时
+    Qt 会把它裁掉，X/Y/Z 标签更是整个消失。这里把每个箭头按方向缩短到
+    画布内，坐标系在任何变换下都保持完整可读。
+    """
+    a = np.asarray(a, dtype=np.float64).reshape(2)
+    b = np.asarray(b, dtype=np.float64).reshape(2)
+    d = b - a
+    if x1 <= x0 or y1 <= y0 or not np.isfinite(d).all():
+        return None
+    t0, t1 = 0.0, 1.0
+    for i, (lo, hi) in enumerate(((x0, x1), (y0, y1))):
+        if abs(d[i]) < 1e-12:
+            if a[i] < lo or a[i] > hi:
+                return None
+            continue
+        ta, tb = (lo - a[i]) / d[i], (hi - a[i]) / d[i]
+        t0 = max(t0, min(ta, tb))
+        t1 = min(t1, max(ta, tb))
+    if t1 <= t0:
+        return None
+    return a + t0 * d, a + t1 * d
+
+
+def axis_screen_geometry(camera, width, height, world_length, ts=1,
+                         axis_scale=0.6):
+    """坐标轴在屏幕上的线段：``[(轴序号, 起点, 终点), ...]``。
+
+    两种形态，都保证箭头与 X/Y/Z 文字完整落在画布内：
+
+    * 工件零点仍在画面里：保留「从原点出发」的坐标轴，把每条轴按方向
+      裁进安全矩形（放大/旋转后箭头会缩短，但方向和原点不变）；
+    * 零点被平移出画面：切换成 CAD 常见的左下角小型坐标架，方向仍由
+      当前相机给出，任何变换下都能看到 X/Y/Z 三轴和字母。
+
+    软件渲染器与 GL 的 2D 叠加层共用这份几何，避免两条路径各写一遍。
+    """
+    tw, th = font5x7.text_size("X", ts)
+    x0 = 12.0 * ts + 8.0
+    x1 = width - (8 * ts + tw + 8.0)
+    y0 = 4 * ts + th + 8.0
+    y1 = height - (th + 12.0)
+    radius = max(18.0, min(34.0 * ts * max(float(axis_scale) / 0.6, 0.5),
+                           width * 0.13, height * 0.16))
+    center = np.array([x0 + radius, y1 - radius], dtype=np.float64)
+    right, up = camera.right(), camera.up()
+
+    def corner_triad():
+        out = []
+        for i in range(3):
+            a = np.zeros(3)
+            a[i] = 1.0
+            d = np.array([float(np.dot(a, right)), -float(np.dot(a, up))])
+            n = float(np.linalg.norm(d))
+            d = d / n if n > 1e-9 else np.array([1.0, 0.0])
+            out.append((i, center.copy(), center + d * radius))
+        return out
+
+    if x1 <= x0 or y1 <= y0 or world_length <= 0:
+        return corner_triad()
+    pts = np.vstack([np.zeros((1, 3)), np.eye(3) * float(world_length)])
+    scr, _, valid = camera.project(pts)
+    if not (bool(valid[0]) and np.isfinite(scr).all()):
+        return corner_triad()
+    o = scr[0]
+    if not (0.0 <= o[0] <= width and 0.0 <= o[1] <= height):
+        return corner_triad()
+    out = []
+    for i in range(3):
+        seg = _clip_segment_to_rect(o, scr[i + 1], x0, y0, x1, y1)
+        if seg is not None:
+            out.append((i, seg[0], seg[1]))
+    return out if len(out) >= 2 else corner_triad()
 
 
 def _width_offsets(width: int) -> list:

@@ -207,23 +207,40 @@ def main() -> int:
     check("放大前后读数一致（极差 < 1%）", spread / SPAN < 0.01,
           f"极差={spread:.4f}")
 
-    print("\n=== 斜视角：三维距离 + 轴向分量 ===")
+    print("\n=== 斜视角：默认投影长度，附带真实三维距离 ===")
     obj_block.visible = False
     obj_cyl.visible = True
     reset("iso")
-    xlo, xhi, ylo, yhi = bbox(cyl.vertices)
-    xm = (xlo + xhi) * 0.5
-    top, bottom = span_y(xm, cyl.vertices)
-    m = measure((xm, top + 0.5), (xm, bottom - 0.5))
-    check("iso 视角量出的仍是三维长度（≥ 名义长度）",
-          m is not None and m.length >= HEIGHT * 0.995,
+    # 取圆柱轴线上靠近两端、投影后仍落在轮廓内的两点。默认口径下主读数必须
+    # 是视图平面内的投影长度；「有表面点时才附带 3D=」的口径由
+    # test_measure_projection.py 单独覆盖，这里只校验读数文本与该状态一致。
+    axis = np.array([[0.0, 0.0, -HEIGHT * 0.5 + 4.0],
+                     [0.0, 0.0, HEIGHT * 0.5 - 4.0]])
+    scr_axis, _, _ = state.camera.project(axis)
+    p1 = (float(scr_axis[0, 0]), float(scr_axis[0, 1]))
+    p2 = (float(scr_axis[1, 0]), float(scr_axis[1, 1]))
+    m = measure(p1, p2)
+    check("iso 主读数为视图投影长度",
+          m is not None and abs(m.length - m.projected_length) < 1e-6,
           f"L={m.length:.3f}" if m else "no measure")
     if m is not None:
-        dz = float(m.points[1][2] - m.points[0][2])
-        check("\u0394Z 与名义长度一致", abs(abs(dz) - HEIGHT) / HEIGHT < 0.01,
-              f"\u0394Z={dz:+.3f}")
+        check("iso 投影读数小于名义轴线长度", m.length < HEIGHT,
+              f"L={m.length:.3f}")
+        spatial = m.spatial_length
+        check("3D= 读数与表面点状态一致",
+              ("3D=" in m.value_text(state.units)) ==
+              (spatial is not None and abs(spatial - m.length) >
+               5e-4 * max(abs(spatial), abs(m.length), 1e-9)),
+              m.value_text(state.units))
         check("状态栏给出三轴分量", "\u0394Z=" in m.delta_text(state.units),
               m.delta_text(state.units))
+        # 切到 3D 模式后主读数改为真实三维距离（不小于投影读数）
+        state.measures.set_mode("3d")
+        m3 = measure(p1, p2)
+        state.measures.set_mode("view")
+        check("3D 模式主读数切到三维距离",
+              m3 is not None and m3.length + 1e-6 >= m.length,
+              f"L={m3.length:.3f}" if m3 else "no measure")
 
     print("\n=== 空白处仍可任意取点（视图平面）===")
     reset("front")

@@ -104,8 +104,9 @@ def main() -> int:
     window._standard_view("iso")
     check("单次大位移被限幅",
           abs(window.canvas._soft_step(500, 60)) <= 60.0)
-    check("小幅位移低增益（精细手感）",
-          abs(window.canvas._soft_step(4, 60)) < 4.0)
+    # CAD 手感：位移严格线性，小幅微调不再被额外增益压扁
+    check("小幅位移线性保持（CAD 手感）",
+          abs(window.canvas._soft_step(4, 60) - 4.0) < 1e-9)
     speed = state.settings.zoom_speed
     state.settings.zoom_speed = 0.2
     # 用 visible_height（正交改 ortho_height、透视改 distance，二者都体现在
@@ -284,6 +285,78 @@ def main() -> int:
     check("动画降分辨率标志", canvas._animating)
     canvas.set_animating(False)
     check("动画结束恢复", not canvas._animating)
+
+    print("\n=== CAD 风格导航 ===")
+    from stl_viewer import mathutil as mu
+    from stl_viewer.navigation import NavOptions
+
+    cam = state.camera
+    ax, ay = 150.0, 110.0
+    p0, n0 = cam.target.copy(), cam.forward().copy()
+    before = mu.ray_plane_intersection(*cam.ray(ax, ay), p0, n0)
+    canvas.wheelEvent(QtGui.QWheelEvent(
+        QtCore.QPointF(ax, ay), QtCore.QPointF(ax, ay),
+        QtCore.QPoint(0, 0), QtCore.QPoint(0, 120),
+        QtCore.Qt.NoButton, QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False))
+    after = mu.ray_plane_intersection(*cam.ray(ax, ay), p0, n0)
+    drift = np.linalg.norm(before - after)
+    check("滚轮以光标为锚点缩放（zoom to cursor）", drift < 1e-6,
+          f"锚点漂移={drift:.2e}")
+    check("滚轮进入交互画质窗口", canvas._nav_active
+          and bool(canvas._frame_params()[3]))
+    canvas._refine_timer.stop()
+    canvas.mark_dirty()
+    check("交互中不会插入全质量精修帧", not canvas._refine_timer.isActive())
+    canvas._finish_nav()
+    check("停手后退出交互窗口", not canvas._nav_active)
+    canvas._refine_timer.stop()
+
+    # 中键按住后再按左键 = CATIA 式旋转
+    canvas.mousePressEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress, QtCore.QPointF(300, 200),
+        QtCore.Qt.MiddleButton, QtCore.Qt.MiddleButton, QtCore.Qt.NoModifier))
+    check("中键单独按下为平移", canvas._drag_mode == "pan")
+    combo = QtCore.Qt.MiddleButton | QtCore.Qt.LeftButton
+    canvas.mousePressEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress, QtCore.QPointF(300, 200),
+        QtCore.Qt.LeftButton, combo, QtCore.Qt.NoModifier))
+    check("中键+左键组合为旋转", canvas._drag_mode == "rotate")
+    yaw0 = cam.yaw
+    canvas.mouseMoveEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseMove, QtCore.QPointF(360, 200),
+        QtCore.Qt.NoButton, combo, QtCore.Qt.NoModifier))
+    check("组合键拖动确实旋转", abs(cam.yaw - yaw0) > 1.0,
+          f"d_yaw={cam.yaw - yaw0:.2f}")
+    canvas.mouseReleaseEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonRelease, QtCore.QPointF(360, 200),
+        QtCore.Qt.LeftButton, QtCore.Qt.MiddleButton, QtCore.Qt.NoModifier))
+    canvas.mouseReleaseEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonRelease, QtCore.QPointF(360, 200),
+        QtCore.Qt.MiddleButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
+
+    # 轨迹球自由旋转 + 惯性
+    canvas.set_nav_options(NavOptions(style="catia", rotate_mode="arcball",
+                                      inertia=True))
+    roll0 = cam.roll
+    drag(canvas, (300, 200), (360, 230), QtCore.Qt.LeftButton)
+    check("轨迹球旋转可产生滚转", abs(cam.roll - roll0) > 0.1,
+          f"d_roll={cam.roll - roll0:.2f}")
+    check("开启惯性后释放启动动画", canvas._spin_timer.isActive())
+    canvas._spin_timer.stop()
+
+    # 绕按下点旋转（Center on point）
+    canvas.set_nav_options(NavOptions(pivot="cursor", inertia=False))
+    expected = cam.ray_to_plane(200, 150)
+    canvas.mousePressEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress, QtCore.QPointF(200, 150),
+        QtCore.Qt.LeftButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    check("按下点成为新的旋转支点", np.allclose(cam.target, expected))
+    canvas.mouseReleaseEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonRelease, QtCore.QPointF(200, 150),
+        QtCore.Qt.LeftButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
+    canvas.set_nav_options(NavOptions())
+    canvas._queue_status()
+    check("状态栏刷新合并到定时器", canvas._status_timer.isActive())
 
     print("\n=== 单位与语言 ===")
     window.set_units("inch")

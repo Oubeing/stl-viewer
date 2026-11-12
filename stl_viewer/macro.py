@@ -1,6 +1,6 @@
 """旋转动画（Spin）与宏录制（Movie / Macro）—— Extras 菜单：
 
-    miSpinEnable / miSpinType(Horizontal, Vertical, RX, RY, RZ, Random)
+    miSpinEnable / miSpinType(Horizontal, Vertical, RX, RY, RZ, Roll, Random)
     miSpinDirection(Positive, Negative) / miSpinReverse
     miSpinSpeed(Low, Medium, High)
     miMovieMacroStartRecording / Execute / Open / Save / miMovieFullScreen
@@ -18,7 +18,7 @@ import numpy as np
 
 from .camera import Camera
 
-SPIN_KINDS = ("horizontal", "vertical", "rx", "ry", "rz", "random")
+SPIN_KINDS = ("horizontal", "vertical", "rx", "ry", "rz", "roll", "random")
 SPIN_SPEEDS = {"low": 18.0, "medium": 55.0, "high": 140.0}   # 度/秒
 
 
@@ -27,7 +27,7 @@ class SpinConfig:
     """旋转动画参数。"""
 
     enabled: bool = False
-    kind: str = "rz"            # horizontal | vertical | rx | ry | rz | random
+    kind: str = "rz"            # horizontal | vertical | rx | ry | rz | roll | random
     direction: int = 1          # 1 正向 / -1 反向
     speed: str = "medium"       # low | medium | high
     custom_speed: float = 0.0   # >0 时覆盖 speed 档位（度/秒）
@@ -69,17 +69,19 @@ class SpinEngine:
         delta = self.config.deg_per_second * dt * self.config.direction
         kind = self.config.kind
         if kind == "horizontal" or kind == "rz":
-            camera.yaw += delta
+            # 绕世界 Z 轴回转：与 yaw 步进完全等价
+            camera.rotate_about_axis(delta, "z")
         elif kind == "vertical":
             camera.pitch = float(np.clip(camera.pitch + delta, -89.9, 89.9))
             if camera.pitch in (89.9, -89.9):
                 self.config.direction *= -1
-        elif kind == "rx":
-            camera.pitch = float(np.clip(camera.pitch + delta, -89.9, 89.9))
-            if camera.pitch in (89.9, -89.9):
-                self.config.direction *= -1
-        elif kind == "ry":
-            camera.roll = (camera.roll + delta) % 360.0
+        elif kind in ("rx", "ry"):
+            # 真正的绕世界 X / Y 轴旋转（旧实现只是改俯仰/滚转，绕 Y 时
+            # 模型看起来像在原地打转，并不是绕 Y 轴翻转）。
+            camera.rotate_about_axis(delta, "x" if kind == "rx" else "y")
+        elif kind == "roll":
+            # 绕视线自身滚转：与「旋转轴 > 视线」共用同一个入口。
+            camera.rotate_about_axis(delta, "view")
         elif kind == "random":
             if now > self._random_until or self._random_target is None:
                 self._random_target = (random.uniform(-180, 180),

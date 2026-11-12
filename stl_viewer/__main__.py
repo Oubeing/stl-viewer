@@ -6,6 +6,8 @@
     python -m stl_viewer model.stl           # 打开模型
     python -m stl_viewer --cli info model.stl
     python -m stl_viewer --cli render model.stl -o out.png --colored
+    python -m stl_viewer --mcp --root .      # 启动 MCP 服务（零依赖 stdio 版）
+    python -m stl_viewer --mcp-sdk --root .  # 启动 MCP 服务（官方 SDK 版）
 """
 
 from __future__ import annotations
@@ -19,6 +21,11 @@ def main(argv=None) -> int:
         from .cli import main as cli_main
 
         return cli_main(argv[1:])
+    if argv and argv[0] in ("--mcp", "--mcp-sdk"):
+        target = ".mcp_stdio" if argv[0] == "--mcp" else ".mcp_fastmcp"
+        from importlib import import_module
+
+        return import_module(target, __package__).main(argv[1:])
     try:
         from .viewer import main as gui_main
     except ImportError as exc:

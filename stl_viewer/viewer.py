@@ -12,16 +12,27 @@
 无 GL 上下文时自动回退到「后台线程软件光栅化 + 快照合成」。两种方式都不在
 paintEvent 里同步跑光栅化，鼠标事件永远不会被一帧渲染堵住。
 
-交互（全部以画布中心为支点）：
-    左键拖拽    旋转（按住 Ctrl 为绕 Z 轴旋转；开启 Rotate around Z 后左键即绕 Z）
-    中键拖拽    平移（Shift + 左键 亦可）
+交互（CAD 风格导航，详见 navigation.py 与 README）：
+    左键拖拽    旋转（Ctrl 为定轴旋转；Alt 为缩放；Shift 为平移）
+    中键拖拽    平移；中键+左/右键 = 旋转；Ctrl/Shift+中键 = 缩放
     右键拖拽    平移；右键单击弹出上下文菜单
-    Alt+左键    缩放（滚轮 / 触控板亦可）
-    拖拽中按 Shift   精细模式（旋转/缩放降到 1/4，平移也放慢）
-    左键单击    测量模式下取点（自动吸附最近顶点）
+    滚轮        以光标为锚点缩放（zoom to cursor）
+    拖拽中按 Shift   精细模式（旋转/缩放/平移降到 1/4）
+    左键单击    测量模式下取点（投影到测量视图平面，读数即屏幕长度）
     方向键      旋转   Shift+方向键 平移   Ctrl+方向键 绕 Z / 俯仰
-    +/-         缩放
-    F / Home    适应窗口      R  复位中心      1~8 标准视图    空格 播放/暂停旋转
+    Ctrl+Z      绕 Z 轴快捷开关
+    Ctrl+Shift+F/X/Y/Z/V   旋转轴：自由 / X / Y / Z / 视线（菜单与工具条下拉同款）
+    +/-         缩放      双击中键 / 双击左键 / F  适应窗口
+    1~8 标准视图      R 复位中心      空格 播放/暂停     Esc 取消测量
+
+导出：Save Picture 直接抓取当前画布帧（不做重渲染），后台只负责 PNG 编码；
+透明背景 / 多分辨率这类确实需要新图的入口才重新光栅化一次。抓帧返回的是
+**拥有自己内存的 numpy 副本**，绝不是 QImage 像素缓冲的视图 —— 后者在局部
+QImage 析构后会让后台编码读到野指针，真实 GL 上表现为保存图片直接崩溃。
+
+旋转：定轴旋转（View > 旋转轴）与旋转动画（Extras > 启用旋转 / 空格）共用
+同一根轴，菜单、工具条、快捷键、空格键的状态由 _set_spin_enabled() 与
+_sync_rotation_ui() 统一维护。
 """
 
 from __future__ import annotations
@@ -43,13 +54,32 @@ from .camera import STANDARD_VIEWS, Camera
 from .glviewport import GLViewport, ViewportOverlay
 from .i18n import Translator
 from .lighting import LIGHT_PRESETS, LightSettings
-from .macro import MacroRecorder, SpinConfig, SpinEngine
+from .macro import MacroRecorder, SpinConfig, SpinEngine, SPIN_KINDS
 from .measure import MEASURE_DEFS, MeasureManager, snap_pick
+from .navigation import (AXIS_LABELS, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, NONE,
+                         PAN, ROTATE, ROTATE_AXES, ROTATE_Z, ZOOM, NAV_STYLES,
+                         NavOptions, NavigationController, resolve_action)
 from .mesh import Mesh
-from .renderer import RenderOptions, SoftwareRenderer
+from .renderer import RenderOptions, SoftwareRenderer, axis_screen_geometry
 from .scene import Object3D, Scene
 from .screenpick import ScreenPicker
 from .settings import AppSettings, UnitSystem, ViewOptions
+
+#: View > 旋转轴：(i18n 键, 轴标识, 快捷键)
+ROTATE_AXIS_MENU = (
+    ("rotate_axis_free", "free", "Ctrl+Shift+F"),
+    ("rotate_axis_x", "x", "Ctrl+Shift+X"),
+    ("rotate_axis_y", "y", "Ctrl+Shift+Y"),
+    ("rotate_axis_z", "z", "Ctrl+Shift+Z"),
+    ("rotate_axis_view", "view", "Ctrl+Shift+V"),
+)
+
+#: 定轴旋转与旋转动画必须共用同一根轴：以前「视图 > 旋转轴」只影响鼠标
+#: 拖拽，「启用旋转」动画始终绕 Z 转，用户选了 X/Y 再启用动画会觉得按钮没用。
+AXIS_TO_SPIN = {"free": "horizontal", "x": "rx", "y": "ry",
+                "z": "rz", "view": "roll"}
+SPIN_TO_AXIS = {"horizontal": "free", "vertical": "free", "rx": "x",
+                "ry": "y", "rz": "z", "roll": "view", "random": "free"}
 
 PICTURE_FILTER = "PNG 图片 (*.png);;JPEG 图片 (*.jpg);;BMP 图片 (*.bmp);;所有文件 (*)"
 MODEL_FILTER = ("模型文件 (*.stl *.stpl *.ply *.stpack *.exe);;"
@@ -63,6 +93,29 @@ COLOR_MODE_CHOICES = ("auto", "uniform", "component", "curvature", "orientation"
 
 def is_colored_mode(mode: str) -> bool:
     return mode in COLORED_MODES
+
+
+def _write_image_file(path: str, image: np.ndarray) -> None:
+    """把渲染结果写到磁盘；PNG 走自带的 zlib 编码，其它格式交给 Qt。
+
+    这个函数只依赖 numpy / QImage，不碰任何 QWidget，可以安全地在后台
+    线程里执行（保存图片不再阻塞界面）。
+    """
+    # 后台线程里编码时，来源 QImage / 共享缓冲可能已经被释放。凡是「不拥有
+    # 自己内存」的视图一律先复制一份，杜绝跨线程读野指针导致进程崩溃。
+    if not image.flags.owndata:
+        image = np.array(image, dtype=np.uint8, copy=True, order="C")
+    if path.lower().endswith(".png"):
+        from .png import write_png
+
+        write_png(path, image)
+        return
+    buffer = np.ascontiguousarray(image)
+    hh, ww, ch = buffer.shape
+    fmt = QtGui.QImage.Format_RGBA8888 if ch == 4 else QtGui.QImage.Format_RGB888
+    qimg = QtGui.QImage(buffer.data, ww, hh, buffer.strides[0], fmt)
+    if not qimg.save(path):
+        raise RuntimeError(f"无法写入图片：{path}")
 
 
 def _gl_platform_available() -> bool:
@@ -94,6 +147,7 @@ class ViewerState:
         self.light = LightSettings()
         self.renderer = SoftwareRenderer()
         self.measures = MeasureManager()
+        self.measures.set_mode(self.settings.measure_mode)
         self.spin = SpinEngine(SpinConfig())
         self.macro = MacroRecorder()
         self.options = RenderOptions.from_view_options(self.settings.view)
@@ -102,13 +156,23 @@ class ViewerState:
         self.viewport: tuple = (1024, 768)
         self.current_path: str | None = None
         self.clipboard_object = None
-        self.rotate_around_z = False
+        #: 定轴旋转：free | x | y | z | view
+        self.rotate_axis = "free"
         self.last_render_seconds = 0.0
         self.fps = 0.0
         self._frame_times: deque = deque(maxlen=240)
 
         self.settings.apply_to(self.camera, self.scene, self.light)
         self.options = self.render_options()
+
+    @property
+    def rotate_around_z(self) -> bool:
+        """兼容旧调用：绕 Z 开关等价于「定轴旋转选到 Z」。"""
+        return self.rotate_axis == "z"
+
+    @rotate_around_z.setter
+    def rotate_around_z(self, value: bool) -> None:
+        self.rotate_axis = "z" if value else "free"
 
     # ---------------- 选项 ----------------
     def render_options(self, interactive: bool = False) -> RenderOptions:
@@ -158,6 +222,7 @@ class ViewerState:
         self.settings.apply_to(self.camera, self.scene, self.light)
         self.options = self.render_options()
         self.measures.set_color(self.settings.view.mesh_color)
+        self.measures.set_mode(self.settings.measure_mode)
         return self.settings_path or self.settings.default_path()
 
     # ---------------- 场景操作 ----------------
@@ -246,11 +311,71 @@ class _RenderTask(QtCore.QRunnable):
         self.bridge.frameReady.emit(image, seconds, self.token)
 
 
+class _PickBridge(QtCore.QObject):
+    """把后台建好的测量拾取索引送回 GUI 线程。"""
+
+    ready = QtCore.pyqtSignal(object, int)     # ScreenPicker | None, token
+
+
+class _PickBuildTask(QtCore.QRunnable):
+    """后台构建 ScreenPicker 的屏幕投影索引。
+
+    84 万面模型建一次索引要几百毫秒；放在 GUI 线程里会让「点测量菜单 /
+    转完视角停一下」明显顿一下。这里用场景快照在后台建，建好再整体替换
+    —— 构建期间点击走视图平面（投影长度本来就是准的），永远不会等它。
+    """
+
+    def __init__(self, scene, camera, token: int, bridge: _PickBridge):
+        super().__init__()
+        self.scene = scene
+        self.camera = camera
+        self.token = token
+        self.bridge = bridge
+
+    def run(self) -> None:
+        picker = None
+        try:
+            candidate = ScreenPicker()
+            if candidate.ensure(self.scene, self.camera):
+                picker = candidate
+        except Exception:
+            picker = None
+        self.bridge.ready.emit(picker, self.token)
+
+
+class _WorkBridge(QtCore.QObject):
+    """后台任务完成通知（tag, result, error）—— 跨线程自动排队。"""
+
+    finished = QtCore.pyqtSignal(str, object, object)
+
+
+class _WorkTask(QtCore.QRunnable):
+    """在后台线程执行一个无副作用（或只操作自己快照）的调用。
+
+    打开大模型、导出 STL、统计、图片编码、网格修复都不该占着 GUI 线程；
+    统一走这里，菜单 / 快捷键 / 工具栏点击后立刻返回，界面继续响应。
+    """
+
+    def __init__(self, tag: str, fn, bridge: _WorkBridge):
+        super().__init__()
+        self.tag = tag
+        self.fn = fn
+        self.bridge = bridge
+
+    def run(self) -> None:
+        try:
+            result = self.fn()
+            error = None
+        except Exception as exc:          # noqa: BLE001 - 统一回报给 GUI
+            result, error = None, exc
+        self.bridge.finished.emit(self.tag, result, error)
+
+
 # ==========================================================================
 # 渲染画布
 # ==========================================================================
 class Canvas(QtWidgets.QWidget):
-    """3D 视口：后台软件光栅化 + 以画布中心为支点的鼠标交互。"""
+    """3D 视口：后台软件光栅化 / GPU 硬件视口 + CAD 风格鼠标导航。"""
 
     statusMessage = QtCore.pyqtSignal(str)
     sceneChanged = QtCore.pyqtSignal()
@@ -262,12 +387,18 @@ class Canvas(QtWidgets.QWidget):
     MIN_RENDER_EDGE = 160          # 交互位图最小边长
     REFINE_DELAY_MS = 90           # 停止操作多久后开始精修全质量帧
     KEY_ROTATE_STEP = 5.0          # 方向键每次旋转的角度（度）
-    # 单次鼠标事件的最大位移：高刷新率鼠标 / 触控板偶尔给出上百像素的
-    # 跳变，不夹住就会「一下转过头 / 一下缩到极限」。
-    MAX_MOUSE_STEP = 60            # 旋转/缩放的每事件像素上限
-    MAX_PAN_STEP = 120             # 平移略放宽，保持跟手
-    ZOOM_DRAG_PER_PX = 0.020       # Alt+左键每像素折算的滚轮档数
-    FINE_MODIFIER_FACTOR = 0.25    # 拖拽中按住 Shift = 精细模式
+    # 兼容旧调用方保留的类常量；实际限幅与灵敏度已移到 navigation.py，
+    # 那里放宽到 200/300 px 且改为严格线性，避免快速拖动被「吃掉」距离。
+    MAX_MOUSE_STEP = 60
+    MAX_PAN_STEP = 120
+    ZOOM_DRAG_PER_PX = 0.020
+    FINE_MODIFIER_FACTOR = 0.25
+    # ---- 交互流畅度 ----
+    STATUS_THROTTLE_MS = 70        # 状态栏文本合并刷新，鼠标事件里不做格式化
+    RESIZE_DEBOUNCE_MS = 50        # 拖窗口边框时不逐像素重排渲染
+    NAV_IDLE_MS = 160              # 最后一次导航操作后多久恢复全质量帧
+    NAV_QUALITY = 0.60             # 交互开始时的预测性画质上限
+    INERTIA_TICK_MS = 16           # 惯性动画步进（≈60Hz）
     # 测量取点的点击容差（屏幕像素，欧氏距离）：手抖 / 触控板 / 高 DPI 下按住
     # 鼠标总会移动几个像素，容差太小会把「想点一下」误判成「拖动旋转」而取不到点。
     # 只要在这个范围内，按压→释放就一律算一次取点（不会误旋转）。
@@ -299,13 +430,22 @@ class Canvas(QtWidgets.QWidget):
         self._press_pos = QtCore.QPoint()
         self._last_pos = QtCore.QPoint()
         self._hover_measure = None
-        self._hover_point = None       # 悬停点（带真实深度），None 表示按视图平面算
+        self._hover_point = None       # 悬停点（落在本次测量的视图平面上）
         self._hover_snapped = False
         self._measure_nav = False      # 本次按压是否已转为视图导航（拖动旋转）
 
         # 测量取点用的屏幕投影索引（纯 CPU，绝不调用 GL）：把当前视图下的
         # 模型投影到屏幕建二维格子，点击只在该格内做精确求交。
         self._screen_picker = ScreenPicker()
+        # 索引用后台线程构建：菜单/快捷键进入测量、视图静止后都只排队，
+        # 绝不在 GUI 线程里跑全量投影（大模型会顿几百毫秒）。
+        self._pick_pool = QtCore.QThreadPool(self)
+        self._pick_pool.setMaxThreadCount(1)
+        self._pick_bridge = _PickBridge(self)
+        self._pick_bridge.ready.connect(self._on_pick_ready,
+                                        QtCore.Qt.QueuedConnection)
+        self._pick_building = False
+        self._pick_token = 0
 
         # 视图停下来后（250ms 没有新的重绘请求）提前把索引建好：
         # 用户旋转完视图再点下去时就不用等那一次重建。
@@ -314,7 +454,7 @@ class Canvas(QtWidgets.QWidget):
         self._pick_prepare_timer.timeout.connect(self._prepare_measure_pick)
 
         # 悬停取点用「停手再算」：鼠标一动就做表面拾取会拖慢大模型，
-        # 先按视图平面画预览，用户停住 90ms 后再补一次真实深度。
+        # 预览直接按本次测量的视图平面算（与最终读数完全同口径）。
         self._hover_pick_timer = QtCore.QTimer(self)
         self._hover_pick_timer.setSingleShot(True)
         self._hover_pick_timer.timeout.connect(self._hover_pick)
@@ -373,6 +513,37 @@ class Canvas(QtWidgets.QWidget):
             except Exception:
                 self._gl = None
                 self._overlay = None
+
+        # ---- CAD 风格导航 ----
+        settings = state.settings
+        nav_options = NavOptions(
+            style=settings.nav_style,
+            rotate_mode=settings.nav_rotate_mode,
+            zoom_anchor=settings.nav_zoom_anchor,
+            pivot=settings.nav_pivot,
+            inertia=settings.nav_inertia,
+        )
+        self._nav = NavigationController(
+            state.camera, nav_options,
+            {"rotate": settings.rotate_speed, "pan": settings.pan_speed,
+             "zoom": settings.zoom_speed})
+        self._nav_active = False
+        self._saved_scale = self._adaptive_scale
+
+        # 交互事件只做「相机数学 + 一次 update」；状态栏、精修、resize、
+        # 惯性都交给定时器合并，鼠标事件循环因此不会被任何一次昂贵操作堵住。
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._publish_status)
+        self._nav_idle_timer = QtCore.QTimer(self)
+        self._nav_idle_timer.setSingleShot(True)
+        self._nav_idle_timer.timeout.connect(self._finish_nav)
+        self._resize_timer = QtCore.QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._resize_render)
+        self._spin_timer = QtCore.QTimer(self)
+        self._spin_timer.timeout.connect(self._spin_step)
+        self._last_spin = time.perf_counter()
         self.setCursor(QtCore.Qt.OpenHandCursor)
 
     # ---------------- 硬件视口接入 ----------------
@@ -430,6 +601,89 @@ class Canvas(QtWidgets.QWidget):
         except Exception:
             pass
 
+    # ---------------- 交互调度（流畅度） ----------------
+    def _queue_status(self) -> None:
+        """合并状态栏刷新：拖动时每 ~70ms 只格式化一次文本。"""
+        if not self._status_timer.isActive():
+            self._status_timer.start(self.STATUS_THROTTLE_MS)
+
+    def _nav_begin(self) -> None:
+        """进入导航窗口：预测性降画质，避免第一帧就掉帧。"""
+        if not self._nav_active:
+            self._saved_scale = self._adaptive_scale
+            self._adaptive_scale = min(self._adaptive_scale, self.NAV_QUALITY)
+        self._nav_active = True
+        self._nav_note()
+
+    def _nav_note(self) -> None:
+        """记录一次导航活动，推迟「恢复全质量帧」的时机。"""
+        self._nav_idle_timer.start(self.NAV_IDLE_MS)
+
+    def _finish_nav(self) -> None:
+        """导航停手：退出交互画质并请求一张全质量精修帧。"""
+        if self._drag_button is not None or self._spin_timer.isActive():
+            self._nav_note()
+            return
+        if not self._nav_active:
+            return
+        self._nav_active = False
+        self._adaptive_scale = max(self._adaptive_scale,
+                                   min(self._quality_ceiling, self._saved_scale))
+        self._quick = True
+        self.mark_dirty()
+        self._queue_status()
+
+    def _spin_step(self) -> None:
+        """惯性旋转的一帧；速度衰减到阈值以下自动停止。"""
+        now = time.perf_counter()
+        dt = now - self._last_spin
+        self._last_spin = now
+        if not self._nav.advance(dt):
+            self._spin_timer.stop()
+            self._nav_note()
+        self.mark_dirty()
+        self._queue_status()
+
+    def _resize_render(self) -> None:
+        self.mark_dirty()
+
+    def set_nav_options(self, options: NavOptions, speeds: dict | None = None) -> None:
+        """由「视图选项」对话框更新导航方案与灵敏度。"""
+        self._nav.configure(options, speeds)
+        self._queue_status()
+
+    def _sync_nav_speeds(self) -> None:
+        """每次开始交互时同步一次灵敏度（设置在会话之间可随时修改）。"""
+        s = self.state.settings
+        self._nav.configure(speeds={"rotate": s.rotate_speed,
+                                    "pan": s.pan_speed,
+                                    "zoom": s.zoom_speed})
+
+    def _button_bits(self, event) -> tuple:
+        """Qt 按键枚举 -> navigation.py 的抽象位标记。"""
+        def bits(buttons):
+            value = 0
+            if buttons & QtCore.Qt.LeftButton:
+                value |= BTN_LEFT
+            if buttons & QtCore.Qt.MiddleButton:
+                value |= BTN_MIDDLE
+            if buttons & QtCore.Qt.RightButton:
+                value |= BTN_RIGHT
+            return value
+        return bits(event.button()), bits(event.buttons())
+
+    @staticmethod
+    def _mod_names(event) -> tuple:
+        mods = event.modifiers()
+        names = []
+        if mods & QtCore.Qt.ShiftModifier:
+            names.append("shift")
+        if mods & QtCore.Qt.ControlModifier:
+            names.append("ctrl")
+        if mods & QtCore.Qt.AltModifier:
+            names.append("alt")
+        return tuple(names)
+
     # ---------------- 渲染 ----------------
     def mark_dirty(self) -> None:
         self._dirty = True
@@ -449,13 +703,21 @@ class Canvas(QtWidgets.QWidget):
             self.update()
             return
         self.update()
-        if not (self._interactive or self._animating):
+        # 滚轮 / 惯性 / 连续缩放都算「交互中」：此时绝不能插一张全质量精修帧，
+        # 否则连续滚动会在每一档之后各卡一次。
+        if not (self._interactive or self._animating or self._nav_active):
             self._quick = True
             self._refine_timer.start(self.REFINE_DELAY_MS)
 
     def _refine(self) -> None:
         """空闲一段时间后把快帧替换成全质量帧。"""
-        if self._interactive or self._animating or not self._quick:
+        # 手动触发精修（离屏测试 / 外部调用）时，若导航已停手则先退出
+        # 交互画质窗口；真实运行里精修计时器不会在 _nav_active 时启动。
+        if (self._nav_active and self._drag_button is None
+                and not self._spin_timer.isActive()):
+            self._finish_nav()
+        if (self._interactive or self._animating or self._nav_active
+                or not self._quick):
             return
         self._quick = False
         self._dirty = True
@@ -468,7 +730,8 @@ class Canvas(QtWidgets.QWidget):
             self._gl.setGeometry(0, 0, self.width(), self.height())
         if self._overlay is not None:
             self._overlay.setGeometry(0, 0, self.width(), self.height())
-        self.mark_dirty()
+        # 拖窗口边框会触发几十次 resize；合并成一次渲染请求，避免逐像素排队。
+        self._resize_timer.start(self.RESIZE_DEBOUNCE_MS)
         super().resizeEvent(event)
 
     def paintEvent(self, event) -> None:
@@ -517,7 +780,8 @@ class Canvas(QtWidgets.QWidget):
         用户随时开始拖动都能很快拿到新的交互帧。导出的高清大图走
         MainWindow._render_picture，不受这里的预算约束。
         """
-        reduced = self._interactive or self._animating or self._quick
+        reduced = (self._interactive or self._animating or self._quick
+                   or self._nav_active)
         scale = 1.0
         if reduced:
             scale = float(np.clip(self._adaptive_scale, self.MIN_QUALITY, 1.0))
@@ -609,9 +873,76 @@ class Canvas(QtWidgets.QWidget):
         if reduced:
             self._adapt_quality(scale, elapsed)
 
+    def _frame_from_qimage(self, qimg, W: int, H: int,
+                           overlay: bool) -> np.ndarray:
+        """QImage → 一份 **自己拥有内存** 的 (H,W,3) uint8 数组。
+
+        这里必须显式 ``copy=True``：``np.frombuffer(qimg.bits())`` 只是借了
+        QImage 的像素内存，``np.ascontiguousarray`` 对本来就连续的切片不会
+        复制。若把它交给后台线程编码，局部 QImage 一释放就是野指针，
+        真实 GL 下会直接 access violation（离屏软件路径常常侥幸不崩）。
+        """
+        if qimg is None or qimg.isNull() or qimg.width() < 1 or qimg.height() < 1:
+            qimg = QtGui.QImage(W, H, QtGui.QImage.Format_RGB888)
+            bg = np.clip(np.asarray(self.state.options.background,
+                                    dtype=np.float64) * 255.0, 0, 255)
+            qimg.fill(QtGui.QColor(int(bg[0]), int(bg[1]), int(bg[2])))
+            overlay = True
+        if qimg.width() != W or qimg.height() != H:
+            qimg = qimg.scaled(W, H, QtCore.Qt.IgnoreAspectRatio,
+                               QtCore.Qt.SmoothTransformation)
+        if overlay:
+            painter = QtGui.QPainter(qimg)
+            try:
+                self._draw_overlay(painter)
+            finally:
+                painter.end()
+        rgb = qimg.convertToFormat(QtGui.QImage.Format_RGB888).copy()
+        stride = int(rgb.bytesPerLine())
+        ptr = rgb.bits()
+        ptr.setsize(int(rgb.byteCount()))
+        flat = np.frombuffer(ptr, dtype=np.uint8).reshape(rgb.height(), stride)
+        frame = np.array(flat[:, :W * 3].reshape(H, W, 3),
+                         dtype=np.uint8, copy=True, order="C")
+        return frame
+
+    def snapshot(self) -> np.ndarray:
+        """抓取当前画布像素 (H,W,3) uint8 —— 所见即所得，绝不重新渲染。
+
+        「保存图片」要的就是屏幕上已经画好的那一帧。以前会另起一次
+        2 倍超采样全场景重渲染，等于把最贵的一帧再算一遍；这里直接从
+        Qt 已合成的画布取图（软件路径 grab 整个 widget，GL 路径读帧缓冲
+        再补画 2D 叠加层），耗时只有一次内存拷贝。
+        """
+        W, H = max(self.width(), 1), max(self.height(), 1)
+        if self._gl_active and self._gl is not None:
+            try:
+                qimg = self._gl.grabFramebuffer()
+            except Exception:
+                qimg = None
+            if qimg is not None and not qimg.isNull():
+                # GL 帧缓冲里没有 Qt 叠加层（引导线 / 测量文字 / 提示框）。
+                return self._frame_from_qimage(qimg, W, H, True)
+            # 读帧缓冲失败时绝不能退化成 self.grab()：把含有可见
+            # QOpenGLWidget 子控件的 widget 抓成 QPixmap 会让部分驱动在
+            # 非绘制阶段再做一次 GL 绘制，是硬崩溃。改用上一次软件帧兜底。
+            buf = getattr(self, "_buffer", None)
+            if isinstance(buf, np.ndarray) and buf.ndim == 3 and buf.shape[2] >= 3:
+                base = np.ascontiguousarray(buf[:, :, :3]).copy()
+                qimg = QtGui.QImage(base.data, base.shape[1], base.shape[0],
+                                    base.strides[0], QtGui.QImage.Format_RGB888)
+                return self._frame_from_qimage(qimg.copy(), W, H, True)
+            return self._frame_from_qimage(None, W, H, True)
+        return self._frame_from_qimage(self.grab().toImage(), W, H, False)
+
     def shutdown(self) -> None:
         """窗口关闭时收掉后台任务，避免任务回调打到已销毁的画布。"""
         self._refine_timer.stop()
+        for name in ("_status_timer", "_nav_idle_timer", "_resize_timer",
+                     "_spin_timer", "_hover_pick_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
         if hasattr(self, "_pick_prepare_timer"):
             self._pick_prepare_timer.stop()
         if self._gl is not None:
@@ -682,7 +1013,7 @@ class Canvas(QtWidgets.QWidget):
 
         # 已点下的临时点：立刻画成十字标记，用户能确认「这一点已经记下了」
         # （以前 pending 只存在数据里、画面上什么都没有，很容易以为是没点上）。
-        # 实心点 = 取自模型表面（有真实深度），空心点 = 取自视图平面。
+        # 实心点 = 该像素下有模型表面点（附带 3D 读数），空心点 = 空白处。
         if pending is not None and pending.points:
             mcol = state.measures.color
             pen = QtGui.QPen(QtGui.QColor(int(mcol[0] * 255),
@@ -711,8 +1042,8 @@ class Canvas(QtWidgets.QWidget):
 
         # 测量悬停预览（橡皮筋 + 实时段长）：让用户在按下鼠标之前就看清
         # 「下一个点」会落在屏幕视图的何处、当前这一段多长。任意位置可拾取。
-        # 预览点默认按视图平面算，停手 90ms 后换成模型真实深度（_hover_pick），
-        # 因此按下鼠标之前看到的长度就是最终结果。
+        # 预览点与最终取点都落在同一个视图平面上，因此按下鼠标之前看到的
+        # 长度就是最终结果（默认口径为投影长度）。
         if pending is not None and self._hover_measure is not None:
             cam = state.camera
             hx, hy = self._hover_measure.x(), self._hover_measure.y()
@@ -758,8 +1089,9 @@ class Canvas(QtWidgets.QWidget):
                     # 再点一下才确定半径（所见即所得）。
                     if pending.kind == "circle2p":
                         center = pending.points[0]
-                        circ2 = mu.circle_from_two_points(
-                            center, hp, cam.forward())
+                        normal = pending.plane_normal if pending.plane_normal \
+                            is not None else cam.forward()
+                        circ2 = mu.circle_from_two_points(center, hp, normal)
                         if circ2 is not None:
                             c, radius, cn = circ2
                             circ = mu.circle_points(c, radius, cn, 96)
@@ -792,7 +1124,8 @@ class Canvas(QtWidgets.QWidget):
                              f"\u25b6 spin: {state.spin.config.kind} "
                              f"({state.spin.config.speed})")
 
-        # 视图原点标记：旋转与缩放都围绕画布中心，这里把支点显式画出来。
+        # 视图支点标记：旋转默认绕画布中心（可设为绕按下点），
+        # 缩放默认以光标为锚点；这里把当前支点显式画出来。
         # 开启完整十字准线时由渲染器画，避免重复叠一层。
         if not state.options.crosshair:
             cx, cy = self.width() / 2.0, self.height() / 2.0
@@ -860,33 +1193,39 @@ class Canvas(QtWidgets.QWidget):
             lo, hi = state.scene.bounds()
             scale = max(float(np.linalg.norm(hi - lo)), 1e-9)
             length = scale * opts.axis_scale
-            tips = np.array([[0.0, 0.0, 0.0],
-                             [length, 0.0, 0.0],
-                             [0.0, length, 0.0],
-                             [0.0, 0.0, length]], dtype=np.float64)
-            s, _, valid = cam.project(tips)
             colors = ((0.86, 0.24, 0.22), (0.34, 0.72, 0.32),
                       (0.26, 0.52, 0.90))
             names = ("X", "Y", "Z")
-            if valid.all() and np.isfinite(s).all():
-                o = QtCore.QPointF(*s[0])
-                for i in range(3):
-                    tip = QtCore.QPointF(*s[i + 1])
-                    painter.setPen(QtGui.QPen(qcolor(colors[i]), 2.0))
-                    painter.drawLine(o, tip)
-                    if opts.axis_labels:
-                        painter.drawText(tip + QtCore.QPointF(7, -4), names[i])
+            metrics = QtGui.QFontMetrics(painter.font())
+            tw = (metrics.horizontalAdvance("X") if hasattr(metrics, "horizontalAdvance")
+                  else metrics.width("X"))
+            th = metrics.height()
+            for i, p0, p1 in axis_screen_geometry(
+                    cam, W, H, length, 1, opts.axis_scale):
+                painter.setPen(QtGui.QPen(qcolor(colors[i]), 2.0))
+                painter.drawLine(QtCore.QPointF(*p0), QtCore.QPointF(*p1))
+                d = p1 - p0
+                norm = float(np.hypot(*d))
+                if norm > 12:
+                    d = d / norm
+                    n = np.array([-d[1], d[0]])
+                    for side in (1.0, -1.0):
+                        a = p1 - d * 9 + n * 5 * side
+                        painter.drawLine(QtCore.QPointF(*a), QtCore.QPointF(*p1))
+                if opts.axis_labels:
+                    tx = float(np.clip(p1[0] + 8, 0, max(W - tw - 2, 0)))
+                    ty = float(np.clip(p1[1] - 4, th, max(H - 2, 0)))
+                    painter.drawText(QtCore.QPointF(tx, ty), names[i])
 
         if opts.crosshair:
             cx, cy = W / 2.0, H / 2.0
-            arm = max(min(W, H) * 0.03, 10.0)
-            gap = arm * 0.28
+            gap = 4.0
             base = np.asarray(opts.background, dtype=np.float64)
             painter.setPen(QtGui.QPen(qcolor(1.0 - base * 0.55), 1.0))
-            for a, b in (((cx - arm, cy), (cx - gap, cy)),
-                         ((cx + gap, cy), (cx + arm, cy)),
-                         ((cx, cy - arm), (cx, cy - gap)),
-                         ((cx, cy + gap), (cx, cy + arm))):
+            for a, b in (((0.0, cy), (cx - gap, cy)),
+                         ((cx + gap, cy), (float(W - 1), cy)),
+                         ((cx, 0.0), (cx, cy - gap)),
+                         ((cx, cy + gap), (cx, float(H - 1)))):
                 painter.drawLine(QtCore.QPointF(*a), QtCore.QPointF(*b))
 
         for item in state.measures.items:
@@ -921,8 +1260,12 @@ class Canvas(QtWidgets.QWidget):
                 s, _, valid = cam.project(
                     np.asarray([anchor], dtype=np.float64))
                 if valid[0]:
-                    painter.drawText(QtCore.QPointF(s[0, 0] + 8, s[0, 1] - 8),
-                                     text)
+                    fm = QtGui.QFontMetrics(painter.font())
+                    tw = (fm.horizontalAdvance(text) if hasattr(fm, "horizontalAdvance")
+                          else fm.width(text))
+                    tx = float(np.clip(s[0, 0] + 8, 0, max(W - tw - 2, 0)))
+                    ty = float(np.clip(s[0, 1] - 8, fm.height(), max(H - 2, 0)))
+                    painter.drawText(QtCore.QPointF(tx, ty), text)
 
     # ---------------- 鼠标 ----------------
     def _update_cursor(self) -> None:
@@ -945,47 +1288,50 @@ class Canvas(QtWidgets.QWidget):
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
+        self._sync_nav_speeds()
         self._press_pos = event.pos()
         self._last_pos = event.pos()
         self._drag_button = event.button()
         self._measure_nav = False
         state = self.state
-        mods = event.modifiers()
-        if event.button() == QtCore.Qt.LeftButton:
-            if mods & QtCore.Qt.ShiftModifier:
-                self._drag_mode = "pan"
-            elif mods & QtCore.Qt.AltModifier:
-                self._drag_mode = "zoom"
-            elif (mods & QtCore.Qt.ControlModifier) or state.rotate_around_z:
-                self._drag_mode = "rotate_z"
-            elif state.measures.pending is not None:
-                self._drag_mode = "measure"
-            else:
-                self._drag_mode = "rotate"
-        elif event.button() == QtCore.Qt.MiddleButton:
-            self._drag_mode = "pan"
-        elif event.button() == QtCore.Qt.RightButton:
-            self._drag_mode = "pan"          # 右键拖动平移；单击仍弹上下文菜单
-        else:
-            self._drag_mode = None
+        button, buttons = self._button_bits(event)
+        mods = self._mod_names(event)
+        action = resolve_action(button, buttons, mods,
+                                self._nav.options.style)
+        if action == ROTATE and state.settings.view.fixed_on_screen:
+            action = ROTATE_Z
+        # 定轴旋转：选中 X / Y / Z / 视线后，普通左键拖拽也按该轴旋转；
+        # Ctrl+左键始终走定轴，未选轴时保持旧的「绕 Z」习惯。
+        fixed_axis = state.rotate_axis
+        if fixed_axis not in ROTATE_AXES:
+            fixed_axis = "free"
+        self._nav.set_axis("z" if fixed_axis == "free" else fixed_axis)
+        if action == ROTATE and fixed_axis != "free":
+            action = ROTATE_Z
+        # 测量取点优先级：左键的普通旋转在测量进行中先当作「可能的点击」，
+        # 只有明显拖动后才在 mouseMoveEvent 里转成视图导航。
+        if (event.button() == QtCore.Qt.LeftButton and action == ROTATE
+                and state.measures.pending is not None):
+            action = "measure"
+        self._drag_mode = action if action != NONE else None
         self._interactive = self._drag_mode is not None
         if self._interactive:
-            # 拖拽期间固定用快帧，别让精修计时器插进来抢时间
             self._quick = True
             self._refine_timer.stop()
+        self._nav_begin()
+        if action != NONE and action != "measure":
+            self._nav.begin(action, event.pos().x(), event.pos().y())
         self._update_cursor()
 
     @staticmethod
     def _soft_step(value: float, cap: float) -> float:
-        """鼠标位移限幅 + 非线性映射。
+        """兼容旧调用：位移只做线性限幅（见 navigation.limit_step）。
 
-        单个事件可能给出上百像素（高刷新率鼠标、触控板、系统延迟后的补发），
-        不夹住就会一步转/缩过头。小幅位移增益更低，方便对准细节；
-        大幅位移正常增益但仍受 cap 限制，整体手感「灵活而不过冲」。
+        旧版对小幅位移叠加 0.55~1.0 的增益，慢速微调被系统性压缩，
+        手感发黏；现在严格与鼠标位移成正比，与 CAD 软件一致。
         """
-        v = float(np.clip(value, -cap, cap))
-        gain = 0.55 + 0.45 * min(1.0, abs(v) / 20.0)
-        return v * gain
+        from .navigation import limit_step
+        return limit_step(value, cap)
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.pos()
@@ -995,7 +1341,7 @@ class Canvas(QtWidgets.QWidget):
         if state.measures.pending is not None and self._drag_button is None:
             self._hover_measure = pos
             # 先用视图平面快速算一个预览点（不拾取，移动中零开销），
-            # 停手 90ms 后再用模型真实深度修正 —— 预览半径与最终数值一致。
+            # 预览半径与最终半径共用同一个视图平面与圆心，二者严格一致。
             cam = state.camera
             ref = state.measures.pending.points[0] \
                 if state.measures.pending.points else cam.target
@@ -1009,54 +1355,25 @@ class Canvas(QtWidgets.QWidget):
             return
         if self._drag_button is None:
             return
-        dx = pos.x() - self._last_pos.x()
-        dy = pos.y() - self._last_pos.y()
         self._last_pos = pos
+        state = self.state
         total = float(np.hypot(pos.x() - self._press_pos.x(),
                                pos.y() - self._press_pos.y()))
-        state = self.state
-        settings = state.settings
-        mode = self._drag_mode
-        if mode == "measure" and total > self.MEASURE_CLICK_TOL:
-            mode = self._drag_mode = "rotate"   # 只有明显拖动才转为旋转
-            self._measure_nav = True            # 本次按压不再算「取点」
+        if self._drag_mode == "measure":
+            if total <= self.MEASURE_CLICK_TOL:
+                return
+            # 明显拖动才转成视图导航；从按下点开始累积，拖动不丢距离。
+            self._drag_mode = ROTATE
+            self._measure_nav = True
             self._hover_measure = None
             self._hover_point = None
             self._hover_pick_timer.stop()
+            self._nav.begin(ROTATE, self._press_pos.x(), self._press_pos.y())
             self._update_cursor()
-        # 拖拽过程中按住 Shift 进入精细模式（不影响「按下时 Shift=平移」）
-        fine = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
-        multiplier = self.FINE_MODIFIER_FACTOR if fine else 1.0
-
-        # 所有视图操作统一以画布中心为原点（支点 = camera.pivot）：
-        # 旋转绕支点、缩放以支点为锚点、平移严格跟随光标且平移后支点仍
-        # 落在画布中心。这样不会出现「绕世界原点转 / 缩放时模型跑掉」。
-        cam = state.camera
-        if mode == "pan":
-            # 平移严格 1:1 跟手，只做跳变限幅，不加非线性增益
-            px = float(np.clip(dx, -self.MAX_PAN_STEP, self.MAX_PAN_STEP))
-            py = float(np.clip(dy, -self.MAX_PAN_STEP, self.MAX_PAN_STEP))
-            cam.pan_about_center(px, py, settings.pan_speed * multiplier)
-        else:
-            sx = self._soft_step(dx, self.MAX_MOUSE_STEP) * multiplier
-            sy = self._soft_step(dy, self.MAX_MOUSE_STEP) * multiplier
-            if mode == "rotate":
-                if settings.view.fixed_on_screen:
-                    cam.rotate_around_z(sx, settings.rotate_speed)
-                else:
-                    cam.orbit_about_center(sx, -sy, settings.rotate_speed)
-            elif mode == "rotate_z":
-                cam.rotate_around_z(sx, settings.rotate_speed)
-            elif mode == "zoom":
-                # Alt+左键上下拖动缩放，锚点固定为画布中心。
-                # 旧系数 0.12 档/像素：拖 100px 就是 12 档 ≈ 3 倍缩放，
-                # 一拖就冲到极限；现在 100px 约 2 档（≈15%）。
-                cam.dolly_about_center(-sy * self.ZOOM_DRAG_PER_PX,
-                                       settings.zoom_speed)
-            else:
-                return
-        self.mark_dirty()
-        self.statusMessage.emit(self._status_text())
+        if self._nav.drag(pos.x(), pos.y(), self._mod_names(event)):
+            self._nav_note()
+            self.mark_dirty()
+            self._queue_status()
 
     def mouseReleaseEvent(self, event) -> None:
         state = self.state
@@ -1079,10 +1396,14 @@ class Canvas(QtWidgets.QWidget):
         self._interactive = False
         self._measure_nav = False
         self._update_cursor()
-        self.mark_dirty()        # 先出快帧，随后自动精修
+        if self._nav.end():
+            self._last_spin = time.perf_counter()
+            self._spin_timer.start(self.INERTIA_TICK_MS)
+        self._nav_note()
+        self.mark_dirty()        # 先出快帧，停手后由 _finish_nav 请求精修
         # 取点后由 _add_measure_point 自己给「下一点」提示，别被就绪文本冲掉
         if not took_point or state.measures.pending is None:
-            self.statusMessage.emit(self._status_text())
+            self._queue_status()
 
     def wheelEvent(self, event) -> None:
         # 支持鼠标滚轮（angleDelta）与触控板（pixelDelta）两种滚动源
@@ -1092,18 +1413,25 @@ class Canvas(QtWidgets.QWidget):
         else:
             steps = event.angleDelta().y() / 120.0
         if steps:
-            # 锚点固定为画布中心，缩放与光标位置无关；触控板一次可能给出
-            # 很大的 pixelDelta，限幅避免一档就跳到极限。按住 Shift 为精细缩放。
-            fine = self.FINE_MODIFIER_FACTOR if (
-                event.modifiers() & QtCore.Qt.ShiftModifier) else 1.0
-            self.state.camera.dolly_about_center(
-                float(np.clip(steps, -2.0, 2.0)) * fine,
-                self.state.settings.zoom_speed)
-            self.mark_dirty()
-            self.statusMessage.emit(self._status_text())
+            # CAD 式 zoom-to-cursor：缩放前后光标下的世界点保持不动；
+            # 在「视图选项」里可切回经典的中心锚点。Shift 为精细缩放。
+            self._sync_nav_speeds()
+            pos = event.pos()
+            if self._nav.wheel(pos.x(), pos.y(), steps,
+                               self._mod_names(event)):
+                self._nav_begin()
+                self._nav_note()
+                self.mark_dirty()
+                self._queue_status()
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == QtCore.Qt.MiddleButton:
+            # CAD 习惯：双击中键 = Zoom Fit
+            self.state.fit_view()
+            self.mark_dirty()
+            event.accept()
+            return
         if event.button() == QtCore.Qt.LeftButton:
             if self.state.measures.pending is not None:
                 # 测量中连续快速点击会被 Qt 合成为「双击」：此时绝不能 fit 视图
@@ -1123,9 +1451,16 @@ class Canvas(QtWidgets.QWidget):
         elif key == QtCore.Qt.Key_R:
             cam.reset_center()
         elif key == QtCore.Qt.Key_Space:
-            cfg = self.state.spin.config
-            cfg.enabled = not cfg.enabled
-            self.state.spin.reset()
+            # 空格与「启用旋转」按钮必须走同一个入口，否则按钮的勾选状态
+            # 会和实际动画状态脱节，用户再点一次按钮看起来「没反应」。
+            owner = self.window()
+            if hasattr(owner, "_set_spin_enabled"):
+                owner._set_spin_enabled(not self.state.spin.config.enabled)
+            else:
+                cfg = self.state.spin.config
+                cfg.enabled = not cfg.enabled
+                self.state.spin.reset()
+                self.mark_dirty()
         elif QtCore.Qt.Key_1 <= key <= QtCore.Qt.Key_8:
             names = ["iso", "front", "back", "left", "right", "top", "bottom",
                      "iso_back"]
@@ -1177,7 +1512,7 @@ class Canvas(QtWidgets.QWidget):
             super().keyPressEvent(event)
             return
         self.mark_dirty()
-        self.statusMessage.emit(self._status_text())
+        self._queue_status()
 
     # ---------------- 拾取 / 测量 ----------------
     def _pick_info(self, pos: QtCore.QPoint) -> None:
@@ -1198,14 +1533,17 @@ class Canvas(QtWidgets.QWidget):
                 f"{hit['object'].name}  {units.format_point(hit['point'])} "
                 f"{units.label}")
             return
-        total = sum(o.mesh.triangle_count for o in state.scene.objects)
-        if total <= 250_000 and total > 0:
-            hit = state.renderer.pick(state.scene, state.camera, x, y)
-            if hit is not None:
-                self.statusMessage.emit(
-                    f"{hit['object'].name}  #{hit['triangle']}  "
-                    f"{units.format_point(hit['point'])} {units.label}")
-                return
+        # 软件路径用已经建好的屏幕投影索引（格子查询 + 局部求交，微秒级）。
+        # 以前这里对 ≤25 万面做全量射线求交，单击会顿几十毫秒；现在索引
+        # 没准备好就直接给视图平面坐标，并在后台补建索引供下一次使用。
+        hit = self._screen_picker.pick(state.scene, state.camera, x, y,
+                                       pad=1.5, allow_build=False)
+        if hit is not None:
+            self.statusMessage.emit(
+                f"{units.format_point(hit)} {units.label}")
+            return
+        if state.scene.objects:
+            self._prepare_measure_pick()
         point = state.camera.ray_to_plane(x, y)
         self.statusMessage.emit(
             f"{units.format_point(point)} {units.label}")
@@ -1265,42 +1603,81 @@ class Canvas(QtWidgets.QWidget):
                                         pad=pad, allow_build=allow_build)
 
     def _prepare_measure_pick(self) -> None:
-        """开启测量工具时先把屏幕投影索引建好，第一次点击就没有额外延迟。"""
+        """后台准备屏幕投影索引（菜单点击 / 视图静止时调用，立即返回）。
+
+        索引与当前视图一致时直接复用；正在构建时不重复排队。构建期间点击
+        使用视图平面点，投影长度仍然正确，所以用户不会感到任何等待。
+        """
+        state = self.state
+        if not state.scene.objects or self._pick_building:
+            return
+        if self._screen_picker.is_current(state.scene, state.camera):
+            return
+        snap_scene = Scene()
+        snap_scene.objects = [copy.copy(o) for o in state.scene.objects]
+        snap_scene.background = state.scene.background
+        snap_scene.background_top = state.scene.background_top
+        snap_scene.gradient_background = state.scene.gradient_background
+        snap_cam = state.camera.copy()
+        snap_cam.set_viewport(self.width(), self.height())
+        self._pick_token += 1
+        self._pick_building = True
+        self._pick_pool.start(_PickBuildTask(snap_scene, snap_cam,
+                                             self._pick_token, self._pick_bridge))
+
+    def _on_pick_ready(self, picker, token: int) -> None:
+        """后台索引就绪：只在与当前视图完全一致时安装。"""
+        self._pick_building = False
+        if picker is None or token != self._pick_token:
+            return
         try:
-            self._screen_picker.ensure(self.state.scene, self.state.camera)
+            if picker.is_current(self.state.scene, self.state.camera):
+                self._screen_picker = picker
         except Exception:
             pass
 
     def _measure_point_at(self, x: float, y: float, pending,
                           pick: bool = True, neighbors: bool = True) -> tuple:
-        """把一次点击变成三维测量点，返回 (point, on_surface)。
+        """把一次点击变成测量点。
 
-        关键：**深度取自模型表面，平面位置取自光标**。
-        只把光标投影到「过支点、垂直视线」的平面，量到的是屏幕投影长度：
-        转个视角同一段 11mm 会变成 9.7mm，镜头一近又会按前后表面的缩放差
-        被放大 —— 这正是用户反馈的「尺寸不对」。
-        拾取到表面后，把光标射线投到「过该表面点、垂直视线」的平面上：
-        点仍然精确落在光标下（所见即所得、标记不跳），深度却是模型的真实
-        深度，于是两点距离就是真实尺寸，不再随视角变化。
+        返回 ``(view_point, surface_point, plane_point, plane_normal)``：
 
-        光标落在空白处时，退回视图平面（过第一个已取点 / 支点），
-        保证「画布任意位置都能取点」这一行为不丢失。
+        * ``view_point`` 是光标射线与**本次测量的视图平面**的交点；一次测量
+          内所有点都在这个平面上，所以两点距离就是屏幕上的投影长度。
+          在 TOP 视图量一条边时，不会因为一端落在凸台顶面、另一端落在
+          底面而把深度差算进长度 —— 这正是 CAD「在视图里量」的口径。
+        * ``surface_point`` 是同一像素下的真实模型表面点（没有命中为
+          None），只用于可选的 3D 读数/3D 模式，不再影响默认长度。
+        * 第一点决定测量平面的深度（取表面点，空白处取支点），随后固定
+          不变；中途旋转视图也不会悄悄改变基准。
+
+        取点全程**不在 GUI 线程重建拾取索引**：索引还没准备好时直接用
+        视图平面点，点击依然立刻响应，后台会补建索引供下一次使用。
         """
         cam = self.state.camera
-        normal = cam.forward()
-        ref = pending.points[0] if pending.points else cam.target
-        hit = (self._surface_hit(
-            x, y, neighbors=neighbors,
-            allow_build=getattr(self, "_hover_allow_build", True))
-            if pick else None)
-        if hit is not None:
-            return cam.ray_to_plane(x, y, plane_point=hit,
-                                    plane_normal=normal), True
-        return cam.ray_to_plane(x, y, plane_point=ref,
-                                plane_normal=normal), False
+        hit = (self._surface_hit(x, y, neighbors=neighbors, allow_build=False)
+               if pick else None)
+        normal = pending.plane_normal
+        anchor = pending.plane_point
+        if normal is None:
+            normal = cam.forward()
+        if anchor is None:
+            anchor = hit if hit is not None else cam.target
+        # 视图在两次点击之间转过较大角度时，旧平面可能与视线接近平行；
+        # 此时退回当前视线方向，避免射线-平面求交退化。
+        _, direction = cam.ray(x, y)
+        n = np.asarray(normal, dtype=np.float64)
+        if abs(float(np.dot(direction, n))) < 1e-6:
+            normal = cam.forward()
+            anchor = cam.target if pending.plane_point is None \
+                else pending.plane_point
+        view_point = cam.ray_to_plane(x, y, plane_point=anchor,
+                                      plane_normal=normal)
+        return view_point, hit, np.asarray(anchor, dtype=np.float64), \
+            np.asarray(normal, dtype=np.float64)
 
     def _hover_pick(self) -> None:
-        """鼠标停住后补一次真实深度拾取（移动中不做，保证拖动不卡）。"""
+        """鼠标停住后刷新一次预览点（移动中不做，保证拖动不卡）。"""
         state = self.state
         pending = state.measures.pending
         if pending is None or self._drag_button is not None \
@@ -1308,15 +1685,11 @@ class Canvas(QtWidgets.QWidget):
             return
         pos = self._hover_measure
         # 悬停预览复用已有索引；索引失效（用户刚转过视图）就先不重建，
-        # 免得停一下鼠标卡一帧 —— 点击时再建，点一定落得下去。
-        self._hover_allow_build = False
-        try:
-            point, snapped = self._measure_point_at(pos.x(), pos.y(), pending,
-                                                    neighbors=False)
-        finally:
-            self._hover_allow_build = True
+        # 免得停一下鼠标卡一帧 —— 后台会补建，点击始终走视图平面。
+        point, surface, _, _ = self._measure_point_at(
+            pos.x(), pos.y(), pending, neighbors=False)
         self._hover_point = point
-        self._hover_snapped = snapped
+        self._hover_snapped = surface is not None
         if self._overlay is not None:
             self._overlay.update()
         else:
@@ -1326,9 +1699,9 @@ class Canvas(QtWidgets.QWidget):
         """在当前屏幕视图平面内取一个测量点。
 
         画布上 **任意位置**（模型上、模型外、空白背景、空场景）都能取点：
-        落在模型上时取真实表面点（量出真实三维尺寸），落在空白处时投影到
-        视图平面。两种方式都是纯 CPU 计算（屏幕投影索引 / 几何投影），
-        不调用 GL，也不会因为 84 万面模型而卡住点击。
+        所有点都落在同一条测量视图平面上，读数就是屏幕投影长度；模型表面
+        点另存一份，供 ``3D=`` 读数和可选的三维模式使用。取点只用已经
+        建好的拾取索引，**绝不在 GUI 线程重建**，84 万面模型点击也不卡。
         """
         state = self.state
         pending = state.measures.pending
@@ -1336,10 +1709,10 @@ class Canvas(QtWidgets.QWidget):
             return
         kind = pending.kind
         x, y = pos.x(), pos.y()
-        point, snapped = self._measure_point_at(x, y, pending)
-        done = state.measures.add_point(point, units=state.units,
-                                        plane=state.camera.forward(),
-                                        snapped=snapped)
+        point, surface, anchor, normal = self._measure_point_at(x, y, pending)
+        done = state.measures.add_point(
+            point, units=state.units, plane=normal, snapped=surface is not None,
+            surface=surface, plane_point=anchor)
         if done is not None:
             self._hover_measure = None
             self._hover_point = None
@@ -1365,7 +1738,7 @@ class Canvas(QtWidgets.QWidget):
             self._hover_point = None
             self.statusMessage.emit(state.tr.tr(state.measures.last_reject))
         else:
-            src = state.tr.tr("measure_on_surface" if snapped
+            src = state.tr.tr("measure_on_surface" if surface is not None
                               else "measure_on_plane")
             self.statusMessage.emit(f"{self._measure_hint_text(pending)}"
                                     f"   |   {src}")
@@ -1503,12 +1876,16 @@ class Canvas(QtWidgets.QWidget):
         stats = state.statistics()
         mode = ""
         if self._drag_mode and self._drag_mode != "measure":
-            mode = {"rotate": "旋转", "rotate_z": "绕Z旋转",
+            mode = {"rotate": "旋转", "rotate_z": "定轴旋转",
                     "pan": "平移", "zoom": "缩放"}.get(self._drag_mode, "")
+            if self._drag_mode == "rotate_z":
+                mode += f"({AXIS_LABELS.get(self._nav.axis, 'Z')})"
             mode = f"{mode} | " if mode else ""
+        nav = NavigationController.summary(self._nav.options)
+        pivot = "支点:光标" if self._nav.options.pivot == "cursor" else "支点:画布中心"
         return (f"{mode}{stats['objects']} obj | {stats['triangles']} tri | "
                 f"{state.last_render_seconds * 1000:.0f} ms | "
-                f"{state.fps:.1f} FPS | 支点:画布中心 | {state.units.label}")
+                f"{state.fps:.1f} FPS | {pivot} | {nav} | {state.units.label}")
 
 
 # ==========================================================================
@@ -1963,6 +2340,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 860)
         self.setAcceptDrops(True)
 
+        # 后台任务池：菜单 / 快捷键触发的重活（载入、导出、统计、截图编码）
+        # 全部丢到这里，GUI 线程只做「发任务」和「收结果 + 刷新控件」。
+        self._work_pool = QtCore.QThreadPool(self)
+        self._work_pool.setMaxThreadCount(2)
+        self._work_bridge = _WorkBridge(self)
+        self._work_bridge.finished.connect(self._on_work_finished,
+                                           QtCore.Qt.QueuedConnection)
+        self._work_jobs: dict = {}          # tag -> (callback, actions)
+        self._work_tasks: dict = {}         # tag -> QRunnable（防被 GC）
+        self._work_busy_tag: str | None = None
+
         self.canvas = Canvas(self.state, self)
         self.setCentralWidget(self.canvas)
         self.canvas.statusMessage.connect(self._show_status)
@@ -1979,6 +2367,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.objectToggleVisible.connect(self._toggle_visible)
         self.panel.requestAction.connect(self._object_action)
 
+        # 内嵌 MCP 服务：菜单 / 工具条 / 状态栏都要反映它的实时运行状态
+        from .mcp_runtime import MCPController
+        self.mcp = MCPController(self.state, self)
+        self.mcp.statusChanged.connect(self._on_mcp_status)
+        self.mcp.sessionChanged.connect(self._on_mcp_session_changed)
+
         self._build_toolbar()
         self._build_menus()
         self._build_statusbar()
@@ -1993,6 +2387,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.state.scene.objects:
             self.state.fit_view()
             self.schedule_fit()
+        # 等事件循环起来再启动服务，避免窗口还没显示就被后台线程回调
+        if self.state.settings.mcp.enabled and self.state.settings.mcp.autostart:
+            QtCore.QTimer.singleShot(0, self._autostart_mcp)
 
     def schedule_fit(self) -> None:
         """窗口尚未完成布局时先标记，等尺寸稳定后再按真实画布重新 fit。"""
@@ -2079,8 +2476,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                               self.save_picture, "Ctrl+Shift+S")
         self.acts["save_multi_res_picture"] = self._act(
             m, "save_multi_res_picture", self.save_multi_res_picture)
-        self.acts["save_picture"] = self._act(
-            m, "save_picture", self.save_picture)
         self.acts["save_picture_transp"] = self._act(
             m, "save_picture_transp",
             lambda: self.save_picture(transparent=True))
@@ -2126,6 +2521,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acts["zoom_fit"] = self._act(m, "zoom_fit", self._fit, "F")
         self.acts["rotate_around_z"] = self._act(
             m, "rotate_around_z", self._toggle_rotate_z, "Ctrl+Z", checkable=True)
+        axis_menu = m.addMenu("")
+        self.menus["rotate_axis"] = axis_menu
+        self._rotate_axis_group = QtWidgets.QActionGroup(self)
+        self._rotate_axis_group.setExclusive(True)
+        for key, ax, shortcut in ROTATE_AXIS_MENU:
+            act = self._act(
+                axis_menu, key,
+                lambda checked=False, a=ax: self._set_rotation_axis(a),
+                shortcut, checkable=True, checked=(ax == "free"))
+            self._rotate_axis_group.addAction(act)
+            self.acts[key] = act
         self.acts["rotation_angles"] = self._act(m, "rotation_angles",
                                                  self.show_rotation_dialog)
         m.addSeparator()
@@ -2211,6 +2617,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.acts["measure_" + kind] = self._act(
                 m, key, lambda checked=False, k=kind: self.canvas.start_measure(k))
         m.addSeparator()
+        self.acts["measure_true3d"] = self._act(
+            m, "measure_true3d", self._toggle_measure_3d, checkable=True,
+            checked=self.state.settings.measure_mode == "3d")
+        m.addSeparator()
         self.acts["delete_first_measure"] = self._act(m, "delete_first_measure",
                                                       self._delete_first_measure)
         self.acts["delete_last_measure"] = self._act(m, "delete_last_measure",
@@ -2269,13 +2679,15 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, kind in (("spin_horizontal", "horizontal"),
                           ("spin_vertical", "vertical"), ("spin_rx", "rx"),
                           ("spin_ry", "ry"), ("spin_rz", "rz"),
-                          ("spin_random", "random")):
+                          ("spin_roll", "roll"), ("spin_random", "random")):
             act = QtWidgets.QAction(self.state.tr.tr(key), self)
             act.setCheckable(True)
             act.setChecked(self.state.spin.config.kind == kind)
             act.triggered.connect(lambda checked, k=kind: self._set_spin_type(k))
             self._spin_type_group.addAction(act)
             type_menu.addAction(act)
+            self.acts[key] = act
+            self._toolbar_actions.append((act, key))
         dir_menu = spin_menu.addMenu("")
         self.menus["spin_direction"] = dir_menu
         self._spin_dir_group = QtWidgets.QActionGroup(self)
@@ -2318,6 +2730,12 @@ class MainWindow(QtWidgets.QMainWindow):
             stl_menu, "remove_tri_intersected",
             lambda: self._object_action("remove_tri", -1))
 
+        m.addSeparator()
+        self.acts["mcp_settings"] = self._act(
+            m, "mcp_settings", self.show_mcp_settings)
+        self.acts["mcp_toggle"] = self._act(
+            m, "mcp_toggle", self.toggle_mcp, checkable=True,
+            checked=bool(state.settings.mcp.enabled))
         m.addSeparator()
         self.acts["statistics"] = self._act(m, "statistics", self.show_statistics)
         self.acts["object_editor2"] = self._act(m, "object_editor",
@@ -2370,8 +2788,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acts["auto_fit_views"] = fit_act
         self._toolbar_actions.append((fit_act, "auto_fit_views"))
         view.addSeparator()
-        for key in ("rotate_around_z", "orthogonal", "full_screen",
-                    "view_options"):
+        # 旋转轴下拉：X / Y / Z / 视线 / 自由，五个入口一次摊开
+        axis_btn = QtWidgets.QToolButton(view)
+        axis_btn.setText(tr.tr("rotate_axis"))
+        axis_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        axis_menu = QtWidgets.QMenu(axis_btn)
+        for key, _, _ in ROTATE_AXIS_MENU:
+            act = self.acts.get(key)
+            if act is not None:
+                axis_menu.addAction(act)
+        axis_btn.setMenu(axis_menu)
+        view.addWidget(axis_btn)
+        self._rotate_axis_button = (axis_btn, "rotate_axis")
+        view.addSeparator()
+        for key in ("orthogonal", "full_screen", "view_options"):
             if self.acts.get(key) is not None:
                 view.addAction(self.acts[key])
 
@@ -2415,6 +2845,12 @@ class MainWindow(QtWidgets.QMainWindow):
             act = self.acts.get(key)
             if act:
                 bar.addAction(act)
+        bar.addSeparator()
+        # MCP 状态按钮：文字由 _update_mcp_ui() 动态维护，不参与 retranslate
+        self.mcp_button = QtWidgets.QToolButton(bar)
+        self.mcp_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self.mcp_button.clicked.connect(self.show_mcp_settings)
+        bar.addWidget(self.mcp_button)
 
     def _toggle_auto_fit(self, checked: bool) -> None:
         """切换标准视图时是否自动 Zoom Fit（工具条上的开关）。"""
@@ -2428,6 +2864,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.render_label = QtWidgets.QLabel("")
         for widget in (self.status_label, self.units_label, self.render_label):
             widget.setMinimumWidth(140)
+        self.mcp_status = QtWidgets.QToolButton()
+        self.mcp_status.setAutoRaise(True)
+        self.mcp_status.clicked.connect(self.show_mcp_settings)
+        bar.addPermanentWidget(self.mcp_status)
         bar.addPermanentWidget(self.units_label)
         bar.addPermanentWidget(self.status_label)
         bar.addPermanentWidget(self.render_label)
@@ -2481,9 +2921,15 @@ class MainWindow(QtWidgets.QMainWindow):
                      getattr(self, "_light_preset_button", None)):
             if pair is not None:
                 pair[0].setText(tr.tr(pair[1]))
+        mode_act = self.acts.get("measure_true3d")
+        if mode_act is not None:
+            mode_act.setChecked(self.state.settings.measure_mode == "3d")
+        # 旋转轴按钮的文字带当前轴（翻译后重新生成），三处勾选一并同步
+        self._sync_rotation_ui()
         self.object_dock.setWindowTitle(tr.tr("objects"))
         self.panel.refresh()
         self._update_statusbar()
+        self._update_mcp_ui()
 
     def _update_statusbar(self) -> None:
         state = self.state
@@ -2496,6 +2942,119 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_status(self, text: str) -> None:
         self.statusBar().showMessage(text, 4000)
         self._update_statusbar()
+
+    # ---------------- 内嵌 MCP 服务 ----------------
+    def _update_mcp_ui(self) -> None:
+        tr = self.state.tr
+        running = self.mcp.running
+        text = tr.tr("mcp_on") if running else tr.tr("mcp_off")
+        self.mcp_button.setText(text)
+        self.mcp_button.setToolTip(tr.tr("mcp_settings"))
+        self.mcp_status.setText(("● " if running else "○ ") + text)
+        self.mcp_status.setToolTip(tr.tr("mcp_settings"))
+        toggle = self.acts.get("mcp_toggle")
+        if toggle is not None:
+            toggle.setChecked(bool(self.state.settings.mcp.enabled))
+
+    def _on_mcp_status(self, running: bool, endpoint: str) -> None:
+        self._update_mcp_ui()
+        if running:
+            self._show_status(self.state.tr.tr("mcp_started", endpoint))
+
+    def _on_mcp_session_changed(self, name: str) -> None:
+        """AI 通过 MCP 改动了当前会话：同步画布、对象面板与状态栏。"""
+        if name in ("load_model", "remove_object", "clear_scene"):
+            self.state.fit_view()
+        self.canvas.mark_dirty()
+        self.panel.refresh()
+        self._on_scene_changed()
+
+    def show_mcp_settings(self) -> None:
+        """打开 MCP 服务设置（服务 / 安全 / 工作区 / AI 客户端）。"""
+        from .mcp_dialog import MCPSettingsDialog
+
+        dialog = MCPSettingsDialog(self, self.mcp)
+        dialog.exec_()
+        self._update_mcp_ui()
+
+    def toggle_mcp(self, checked: bool) -> None:
+        """菜单开关：立即启停服务并保存设置。"""
+        ok, message = self.mcp.set_enabled(bool(checked))
+        try:
+            self.state.save_settings()
+        except OSError:
+            pass
+        self._update_mcp_ui()
+        if checked and not ok:
+            QtWidgets.QMessageBox.warning(
+                self, self.state.tr.tr("mcp_settings"), message)
+
+    def _autostart_mcp(self) -> None:
+        if (self.state.settings.mcp.enabled and
+                self.state.settings.mcp.autostart and not self.mcp.running):
+            ok, message = self.mcp.start()
+            if not ok:
+                self._show_status(f"MCP: {message}")
+
+    # ---------------- 后台任务 ----------------
+    #: 小于这个面数的网格操作直接同步完成（几毫秒，保持调用语义直观）；
+    #: 更大的才进后台，避免几十万面时菜单点一下顿住。
+    SYNC_MESH_LIMIT = 50_000
+
+    def _run_mesh_task(self, tag: str, work, done, triangles: int,
+                       busy: str | None = None, actions=()) -> None:
+        if triangles <= self.SYNC_MESH_LIMIT:
+            try:
+                done(work())
+            except Exception as exc:      # noqa: BLE001
+                QtWidgets.QMessageBox.critical(
+                    self, self.state.tr.tr("error"), f"{exc}")
+            return
+        self._run_async(tag, work, done, busy=busy, actions=actions)
+
+    def _run_async(self, tag: str, fn, on_done=None, busy: str | None = None,
+                   actions=()) -> bool:
+        """提交一个后台任务，立即返回；完成后在 GUI 线程调用 ``on_done``。
+
+        同一个 tag 同时只允许一个任务（避免连点排队）。``actions`` 里的
+        动作在任务期间临时置灰，其余界面（画布、菜单、快捷键）照常响应。
+        """
+        if tag in self._work_jobs:
+            self._show_status(self.state.tr.tr("busy_wait"))
+            return False
+        self._work_jobs[tag] = (on_done, tuple(actions))
+        self._work_busy_tag = tag
+        for key in actions:
+            act = self.acts.get(key)
+            if act is not None:
+                act.setEnabled(False)
+        if busy:
+            self._show_status(busy)
+        task = _WorkTask(tag, fn, self._work_bridge)
+        self._work_tasks[tag] = task
+        self._work_pool.start(task)
+        return True
+
+    def _on_work_finished(self, tag: str, result, error) -> None:
+        self._work_tasks.pop(tag, None)
+        job = self._work_jobs.pop(tag, None)
+        callback, actions = job if job else (None, ())
+        for key in actions:
+            act = self.acts.get(key)
+            if act is not None:
+                act.setEnabled(True)
+        if self._work_busy_tag == tag:
+            self._work_busy_tag = None
+        if error is not None:
+            QtWidgets.QMessageBox.critical(
+                self, self.state.tr.tr("error"), f"{error}")
+            return
+        if callback is not None:
+            try:
+                callback(result)
+            except Exception as exc:      # noqa: BLE001
+                QtWidgets.QMessageBox.critical(
+                    self, self.state.tr.tr("error"), f"{exc}")
 
     def keyPressEvent(self, event) -> None:
         # ESC 取消测量：焦点在主窗口（工具条/菜单刚点过）时也能生效
@@ -2554,16 +3113,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.open_path(path)
 
+    #: 小于这个体积的模型直接同步载入（几十毫秒，测试与日常小件都不受影响）
+    SYNC_LOAD_LIMIT = 4 * 1024 * 1024
+
     def open_path(self, path: str) -> None:
         tr = self.state.tr
-        # 启动已是空场景，直接追加载入；载入后把模型包围盒中心对齐画布中心。
+        if "open" in self._work_jobs:
+            self._show_status(tr.tr("busy_wait"))
+            return
         try:
-            obj = self.state.load_file(path)
-        except Exception as exc:
+            size = os.path.getsize(path)
+        except OSError as exc:
             QtWidgets.QMessageBox.critical(
                 self, tr.tr("error"), tr.tr("file_open_error", path) + f"\n\n{exc}")
             return
+        weld = bool(self.state.settings.auto_weld)
+        if size <= self.SYNC_LOAD_LIMIT:
+            try:
+                mesh = Mesh.load(path, weld=weld)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(
+                    self, tr.tr("error"),
+                    tr.tr("file_open_error", path) + f"\n\n{exc}")
+                return
+            self._finish_open(path, mesh)
+            return
+        # 大模型：解析 + 焊接顶点可能要几秒，放到后台，界面继续响应。
+        def work():
+            return Mesh.load(path, weld=weld)
+
+        self._run_async("open", work,
+                        lambda mesh: self._finish_open(path, mesh),
+                        busy=tr.tr("loading_model"),
+                        actions=("open",))
+
+    def _finish_open(self, path: str, mesh) -> None:
+        """载入完成后的 GUI 收尾（同步/后台两条路径共用）。"""
+        name = os.path.splitext(os.path.basename(path))[0]
+        obj = self.state.scene.add_mesh(mesh, name=name, source_path=path)
+        self.state.current_path = path
+        self.state.settings.add_recent(path)
         self.state.settings.default_directory = os.path.dirname(path)
+        self.state.measures.clear()
         self.state.fit_view()
         self.schedule_fit()          # 布局稳定后按真实画布尺寸再适配一次
         self.panel.refresh()
@@ -2571,9 +3162,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._recent_menu()
         # 深度统计（连通分量 / 边使用计数）在 84 万面模型上要十几秒，
         # 打开文件时只为显示一行提示，直接用面数即可。
+        try:
+            size_txt = stl_io.human_size(os.path.getsize(path))
+        except OSError:
+            size_txt = ""
         self._show_status(
-            f"{obj.name}: {obj.mesh.triangle_count} tri  "
-            f"{stl_io.human_size(os.path.getsize(path))}")
+            f"{obj.name}: {obj.mesh.triangle_count} tri  {size_txt}")
 
     def _recent_menu(self) -> None:
         menu = self.acts["recent"]
@@ -2587,21 +3181,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self.state.scene.objects[0] if self.state.scene.objects else None)
         if obj is None:
             return
+        if "save_stl" in self._work_jobs:
+            self._show_status(self.state.tr.tr("busy_wait"))
+            return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, self.state.tr.tr("export_stl"),
             os.path.join(self.state.settings.default_directory, obj.name + ".stl"),
             "STL (*.stl)")
         if not path:
             return
-        if path.lower().endswith(".txt"):
-            stl_io.write_ascii_stl(path, obj.mesh.vertices, obj.mesh.triangles, obj.name)
-        else:
-            stl_io.write_binary_stl(path, obj.mesh.vertices, obj.mesh.triangles)
-        self._show_status(f"{self.state.tr.tr('save')}: {path}")
+        # 只传数组引用：网格改动（修复/拆分）会整体替换数组，后台写盘期间
+        # 拿到的仍是一致的旧快照；这样不必在点击时复制几十 MB 顶点。
+        vertices, triangles, name = obj.mesh.vertices, obj.mesh.triangles, obj.name
+        ascii_mode = path.lower().endswith(".txt")
+
+        def work():
+            if ascii_mode:
+                stl_io.write_ascii_stl(path, vertices, triangles, name)
+            else:
+                stl_io.write_binary_stl(path, vertices, triangles)
+            return path
+
+        self._run_async(
+            "save_stl", work,
+            lambda saved: self._show_status(
+                f"{self.state.tr.tr('save')}: {saved}"),
+            busy=self.state.tr.tr("saving_stl"),
+            actions=("save_object", "export_stl"))
 
     def _render_picture(self, transparent: bool = False,
                         supersample: int | None = None,
                         double: bool = False) -> np.ndarray:
+        """同步渲染一张高分辨率图片（离屏测试 / 脚本 / 透明与多分辨率导出）。
+
+        普通「保存图片」不再走这里：它直接抓取画布当前帧（见
+        :meth:`Canvas.snapshot`），无需重新光栅化整个场景。
+        """
         state = self.state
         opts = state.render_options()
         if transparent:
@@ -2615,55 +3230,159 @@ class MainWindow(QtWidgets.QMainWindow):
                                      options=opts, light=state.light,
                                      measurements=state.measures.items)
 
-    def _save_picture(self, image: np.ndarray, title: str) -> None:
+    # ---------------- 图片导出（后台） ----------------
+    #: 单张导出的渲染像素上限；超过就自动降超采样，避免 4K/多分辨率导出
+    #: 一次吃掉几十秒 CPU（渲染再快，用户也不想点一下等半天）。
+    MAX_PICTURE_PIXELS = 12_000_000
+    MAX_MULTI_RES_PIXELS = 16_000_000
+
+    def _bounded_supersample(self, width: int, height: int,
+                             supersample: int, limit: int) -> int:
+        ss = max(int(supersample), 1)
+        while ss > 1 and width * height * ss * ss > limit:
+            ss -= 1
+        return max(ss, 1)
+
+    def _snapshot_job(self, path: str):
+        """普通保存：只把画布当前帧编码写盘，没有任何渲染工作。"""
+        frame = self.canvas.snapshot()
+        size = (int(frame.shape[1]), int(frame.shape[0]))
+
+        def work():
+            _write_image_file(path, frame)
+            return size, 1
+
+        return work
+
+    def _picture_job(self, path: str, width: int, height: int,
+                     transparent: bool = False, supersample: int = 2,
+                     limit: int = MAX_PICTURE_PIXELS):
+        """构造一个可在后台线程执行的「渲染 + 写文件」任务。
+
+        只捕获渲染需要的快照，不引用任何 QWidget；返回 (work, 尺寸信息)。
+        """
+        state = self.state
+        size = (max(int(width), 1), max(int(height), 1))
+        opts = state.render_options()
+        opts.transparent_background = bool(transparent)
+        opts.supersample = self._bounded_supersample(
+            size[0], size[1], supersample, limit)
+        scene = Scene()
+        scene.objects = [copy.copy(o) for o in state.scene.objects]
+        scene.background = state.scene.background
+        scene.background_top = state.scene.background_top
+        scene.gradient_background = state.scene.gradient_background
+        camera = state.camera.copy()
+        camera.set_viewport(*size)
+        light = copy.deepcopy(state.light)
+        measurements = list(state.measures.items)
+
+        def work():
+            renderer = SoftwareRenderer()
+            image = renderer.render(scene, camera, size=size, options=opts,
+                                    light=light, measurements=measurements)
+            _write_image_file(path, image)
+            return size, opts.supersample
+
+        return work, size
+
+    def _export_picture_async(self, title: str, default_name: str,
+                              transparent: bool = False,
+                              supersample: int = 2, scale: int = 1,
+                              limit: int | None = None) -> None:
+        """先问路径，再把「当前画布」编码写盘 —— 点击后立即有文件对话框。
+
+        * 普通保存 / 不透明 / 1 倍尺寸：直接抓帧，无渲染；
+        * 透明背景与多分辨率是真正需要新图的场景，才重新渲染一次。
+        """
+        if "picture" in self._work_jobs:
+            self._show_status(self.state.tr.tr("busy_wait"))
+            return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, title, os.path.join(self.state.settings.default_directory,
-                                      "picture.png"), PICTURE_FILTER)
+            self, title,
+            os.path.join(self.state.settings.default_directory, default_name),
+            PICTURE_FILTER)
         if not path:
             return
-        if path.lower().endswith(".png"):
-            from .png import write_png
+        tr = self.state.tr
+        snapshot_mode = not transparent and max(int(scale), 1) == 1
+        if snapshot_mode:
+            work = self._snapshot_job(path)
+        else:
+            width = self.canvas.width() * max(int(scale), 1)
+            height = self.canvas.height() * max(int(scale), 1)
+            cap = (self.MAX_MULTI_RES_PIXELS if scale > 1
+                   else self.MAX_PICTURE_PIXELS)
+            if limit is not None:
+                cap = limit
+            work, _size = self._picture_job(path, width, height, transparent,
+                                            supersample, cap)
+        tag = "picture"
+        self._run_async(
+            tag, work,
+            lambda info: self._picture_saved(path, info),
+            busy=tr.tr("saving_picture" if snapshot_mode
+                       else "rendering_picture"),
+            actions=("save_picture", "save_picture_transp",
+                     "save_multi_res_picture", "copy_picture_clipboard"))
 
-            write_png(path, image)
-        else:  # 其它格式交给 Qt 编码
-            buffer = np.ascontiguousarray(image)
-            hh, ww, ch = buffer.shape
-            fmt = QtGui.QImage.Format_RGBA8888 if ch == 4 else QtGui.QImage.Format_RGB888
-            qimg = QtGui.QImage(buffer.data, ww, hh, buffer.strides[0], fmt)
-            qimg.save(path)
-        self._show_status(f"{self.state.tr.tr('save_picture')}: {path}")
-
-    def save_picture(self) -> None:
-        self._save_picture(self._render_picture(), self.state.tr.tr("save_picture"))
-
-    def save_multi_res_picture(self) -> None:
-        self._save_picture(self._render_picture(supersample=3, double=True),
-                           self.state.tr.tr("save_multi_res_picture"))
+    def _picture_saved(self, path: str, info) -> None:
+        tr = self.state.tr
+        try:
+            size_txt = f"{int(info[0][0])}\u00d7{int(info[0][1])}"
+            note = f"  ({size_txt})"
+        except Exception:
+            note = ""
+        self._show_status(f"{tr.tr('picture_saved')}: {path}{note}")
 
     def save_picture(self, transparent: bool = False) -> None:
-        title = self.state.tr.tr("save_picture_transp" if transparent
-                                 else "save_picture")
-        image = self._render_picture(transparent=transparent, supersample=2)
-        self._save_picture(image, title)
+        """普通保存直接抓当前画布帧；透明背景需要一张新图，只渲染 1 倍。"""
+        tr = self.state.tr
+        self._export_picture_async(
+            tr.tr("save_picture_transp" if transparent else "save_picture"),
+            "picture_transparent.png" if transparent else "picture.png",
+            transparent=transparent,
+            supersample=1 if transparent else 2)
+
+    def save_multi_res_picture(self) -> None:
+        # 2 倍分辨率、1 倍超采样：像素量是普通导出的 4 倍，但不会像
+        # 「2 倍尺寸 × 3 倍超采样」那样到 36 倍，几秒内即可完成。
+        self._export_picture_async(
+            self.state.tr.tr("save_multi_res_picture"),
+            "picture_2x.png", supersample=1, scale=2)
 
     def copy_picture_to_clipboard(self) -> None:
-        image = self._render_picture(supersample=2)
-        buffer = np.ascontiguousarray(image)
+        """复制当前画布帧到剪贴板。
+
+        抓帧 + 一次内存拷贝都在毫秒级，直接在 GUI 线程完成即可（QClipboard
+        本来就要求主线程），不再排后台渲染任务。
+        """
+        state = self.state
+        buffer = self.canvas.snapshot()
         hh, ww, ch = buffer.shape
-        fmt = QtGui.QImage.Format_RGBA8888 if ch == 4 else QtGui.QImage.Format_RGB888
-        qimg = QtGui.QImage(buffer.data, ww, hh, buffer.strides[0], fmt).copy()
+        fmt = (QtGui.QImage.Format_RGBA8888 if ch == 4
+               else QtGui.QImage.Format_RGB888)
+        qimg = QtGui.QImage(buffer.data, ww, hh,
+                            buffer.strides[0], fmt).copy()
         QtWidgets.QApplication.clipboard().setImage(qimg)
-        self._show_status(self.state.tr.tr("copy_picture_clipboard"))
+        self._show_status(state.tr.tr("copy_picture_done"))
 
     def show_file_size(self) -> None:
         path = self.state.current_path
         if not path:
             self._show_status(self.state.tr.tr("no_objects"))
             return
-        report = stl_io.file_size_report(path)
-        lines = [f"{k}: {v}" for k, v in report.items()]
-        StatisticsDialog("\n".join(lines), self.state.tr.tr("show_stl_filesize"),
-                         self).exec_()
+
+        def show(report):
+            lines = [f"{k}: {v}" for k, v in report.items()]
+            StatisticsDialog("\n".join(lines),
+                             self.state.tr.tr("show_stl_filesize"),
+                             self).exec_()
+
+        # file_size_report 会完整解析一遍文件，大模型上要几百毫秒；
+        # 放到后台，菜单点击立即返回。
+        self._run_async("file_size", lambda: stl_io.file_size_report(path), show,
+                        busy=self.state.tr.tr("busy_working"))
 
     def save_object_settings(self) -> None:
         obj = self.state.scene.active_object()
@@ -2728,10 +3447,81 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state.standard_view(name)
         self.canvas.mark_dirty()
 
+    def _sync_rotation_ui(self) -> None:
+        """把「旋转轴 / 旋转方式 / 启用旋转」三处勾选与运行状态对齐。
+
+        菜单、工具条、快捷键、空格键共用一个状态，任何一个入口改动后都
+        由这里统一刷新，避免出现「按钮打着勾但没转」或「按钮没反应」。
+        """
+        state = self.state
+        axis = state.rotate_axis
+        for key, ax, _ in ROTATE_AXIS_MENU:
+            act = self.acts.get(key)
+            if act is not None:
+                act.setChecked(ax == axis)
+        z_act = self.acts.get("rotate_around_z")
+        if z_act is not None:
+            z_act.setChecked(axis == "z")
+        for kind in SPIN_KINDS:
+            act = self.acts.get("spin_" + kind)
+            if act is not None:
+                act.setChecked(state.spin.config.kind == kind)
+        spin_act = self.acts.get("spin_enable")
+        if spin_act is not None and spin_act.isChecked() != state.spin.config.enabled:
+            blocked = spin_act.blockSignals(True)   # 只同步显示，别再触发一次
+            spin_act.setChecked(state.spin.config.enabled)
+            spin_act.blockSignals(blocked)
+        pair = getattr(self, "_rotate_axis_button", None)
+        if pair is not None:
+            tr = state.tr
+            pair[0].setText(f"{tr.tr('rotate_axis')}: "
+                            f"{AXIS_LABELS.get(axis, axis)}")
+
+    def _set_spin_enabled(self, enabled: bool) -> None:
+        """启用 / 停止旋转动画（菜单、工具条、空格键的唯一入口）。"""
+        state = self.state
+        enabled = bool(enabled)
+        state.spin.config.enabled = enabled
+        state.spin.reset()
+        # 动画用的轴必须与当前定轴旋转一致，否则选了 X 轴却仍绕 Z 转。
+        kind = AXIS_TO_SPIN.get(state.rotate_axis)
+        if kind is not None and state.spin.config.kind != kind:
+            state.spin.config.kind = kind
+            state.spin.reset()
+        self._sync_rotation_ui()
+        self.canvas.set_animating(enabled or state.macro.playback_active)
+        self.canvas.mark_dirty()
+        tr = state.tr
+        note = (f"  [{AXIS_LABELS.get(state.rotate_axis, state.rotate_axis)}]"
+                if enabled else "")
+        self._show_status(
+            f"{tr.tr('spin_started' if enabled else 'spin_stopped')}{note}")
+
+    def _set_rotation_axis(self, axis: str) -> None:
+        """选择定轴旋转的轴：free / x / y / z / view。
+
+        菜单、快捷键、工具条下拉共用这一入口；鼠标拖拽与「启用旋转」动画
+        共用同一根轴，选中即生效，动画进行中也会立刻换轴。
+        """
+        axis = axis if axis in ROTATE_AXES else "free"
+        state = self.state
+        state.rotate_axis = axis
+        self.canvas._nav.set_axis("z" if axis == "free" else axis)
+        kind = AXIS_TO_SPIN.get(axis, "horizontal")
+        if state.spin.config.kind != kind:
+            state.spin.config.kind = kind
+            state.spin.reset()
+        self._sync_rotation_ui()
+        self.canvas.mark_dirty()
+        tr = state.tr
+        self._show_status(f"{tr.tr('rotate_axis')}: "
+                          f"{AXIS_LABELS.get(axis, axis)}"
+                          + (f"  ·  {tr.tr('spin')}" if state.spin.config.enabled
+                             else ""))
+
     def _toggle_rotate_z(self, checked: bool) -> None:
-        """View > Rotate around Z：左键拖拽改为绕刀具回转轴旋转。"""
-        self.state.rotate_around_z = checked
-        self._show_status("rotate around Z: " + ("on" if checked else "off"))
+        """View > Rotate around Z（Ctrl+Z）：绕 Z 的快捷开关。"""
+        self._set_rotation_axis("z" if checked else "free")
 
     def _toggle_ortho(self, checked: bool) -> None:
         self.state.camera.set_orthographic(checked)
@@ -2795,6 +3585,44 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(tr.tr("pan_speed"), pan[1])
         form.addRow(tr.tr("zoom_speed"), zoom[1])
 
+        # ---- CAD 风格视图导航 ----
+        form.addRow(QtWidgets.QLabel("— 视图导航（对标 CATIA / SolidWorks） —"))
+
+        def combo(pairs, current):
+            box = QtWidgets.QComboBox(dialog)
+            for value, label in pairs:
+                box.addItem(label, value)
+            idx = box.findData(current)
+            box.setCurrentIndex(idx if idx >= 0 else 0)
+            return box
+
+        nav_style = combo(
+            [("classic", "经典（原行为）"), ("cad", "CAD（默认）"),
+             ("catia", "CATIA"), ("solidworks", "SolidWorks")],
+            settings.nav_style)
+        rotate_mode = combo(
+            [("turntable", "转台（Z 轴朝上）"),
+             ("arcball", "自由轨迹球（可越过极点 / 滚转）")],
+            settings.nav_rotate_mode)
+        zoom_anchor = combo(
+            [("cursor", "光标（zoom to cursor）"), ("center", "画布中心")],
+            settings.nav_zoom_anchor)
+        pivot_mode = combo(
+            [("center", "画布中心"), ("cursor", "按下点（Center on point）")],
+            settings.nav_pivot)
+        nav_inertia = QtWidgets.QCheckBox("释放后惯性旋转", dialog)
+        nav_inertia.setChecked(bool(settings.nav_inertia))
+        form.addRow("导航方案", nav_style)
+        form.addRow("旋转方式", rotate_mode)
+        form.addRow("缩放锚点", zoom_anchor)
+        form.addRow("旋转支点", pivot_mode)
+        form.addRow(nav_inertia)
+        # CATIA 的自由旋转习惯：切到该方案时默认启用轨迹球（仍可手动改回）
+        def _style_changed(idx):
+            if nav_style.itemData(idx) == "catia" and rotate_mode.currentData() == "turntable":
+                rotate_mode.setCurrentIndex(rotate_mode.findData("arcball"))
+        nav_style.currentIndexChanged.connect(_style_changed)
+
         # ---- 渲染性能与网格处理 ----
         form.addRow(QtWidgets.QLabel(f"— {tr.tr('render_perf')} —"))
         quality = self._slider_row(dialog, settings.interactive_quality * 100, 15, 100)
@@ -2824,6 +3652,22 @@ class MainWindow(QtWidgets.QMainWindow):
             settings.rotate_speed = max(rotate[0].value(), 1) / 100.0
             settings.pan_speed = max(pan[0].value(), 1) / 100.0
             settings.zoom_speed = max(zoom[0].value(), 1) / 100.0
+            nav_options = NavOptions(
+                style=nav_style.currentData(),
+                rotate_mode=rotate_mode.currentData(),
+                zoom_anchor=zoom_anchor.currentData(),
+                pivot=pivot_mode.currentData(),
+                inertia=nav_inertia.isChecked(),
+            ).normalized()
+            settings.nav_style = nav_options.style
+            settings.nav_rotate_mode = nav_options.rotate_mode
+            settings.nav_zoom_anchor = nav_options.zoom_anchor
+            settings.nav_pivot = nav_options.pivot
+            settings.nav_inertia = nav_options.inertia
+            self.canvas.set_nav_options(
+                nav_options,
+                {"rotate": settings.rotate_speed, "pan": settings.pan_speed,
+                 "zoom": settings.zoom_speed})
             self.canvas.set_interactive_quality(value)
             self.state.settings.antialias = antialias.isChecked()
             self.canvas.mark_dirty()
@@ -2945,6 +3789,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.canvas.mark_dirty()
 
     # ---------------- 测量 ----------------
+    def _toggle_measure_3d(self, checked: bool) -> None:
+        """切换长度口径：视图投影（默认）/ 真实三维距离。
+
+        默认口径与 CAD 的「在视图里量」一致：TOP 视图量到的就是投影长度，
+        不受取点深度影响；需要在轴测视图里量真实空间距离时再打开。
+        """
+        tr = self.state.tr
+        mode = "3d" if checked else "view"
+        self.state.settings.measure_mode = mode
+        self.state.measures.set_mode(mode)
+        self._show_status(tr.tr("measure_mode_changed",
+                                tr.tr("measure_mode_3d" if checked
+                                      else "measure_mode_view")))
+
     def _delete_first_measure(self) -> None:
         self.state.measures.delete_first()
         self.panel.refresh()
@@ -3002,13 +3860,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- 旋转动画 ----------------
     def _toggle_spin(self, checked: bool) -> None:
-        self.state.spin.config.enabled = checked
-        self.state.spin.reset()
-        self.canvas.mark_dirty()
+        self._set_spin_enabled(checked)
 
     def _set_spin_type(self, kind: str) -> None:
-        self.state.spin.config.kind = kind
-        self.state.spin.reset()
+        """旋转方式与定轴旋转双向联动：选 RX 等于把拖拽轴也切成 X。"""
+        if kind not in SPIN_KINDS:
+            return
+        state = self.state
+        state.spin.config.kind = kind
+        state.spin.reset()
+        axis = SPIN_TO_AXIS.get(kind, "free")
+        state.rotate_axis = axis
+        self.canvas._nav.set_axis("z" if axis == "free" else axis)
+        self._sync_rotation_ui()
+        self.canvas.mark_dirty()
+        tr = state.tr
+        self._show_status(f"{tr.tr('spin_axis_hint')}: "
+                          f"{AXIS_LABELS.get(axis, axis)}")
 
     def _set_spin_direction(self, value: int) -> None:
         self.state.spin.config.direction = value
@@ -3124,8 +3992,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_mesh_statistics(obj)
             return
         elif action == "copy":
-            state.clipboard_object = copy.deepcopy(obj)
-            self._show_status(state.tr.tr("copy_object"))
+            # 84 万面深拷贝要几百毫秒；大模型放到后台，小模型直接完成。
+            def copied(copy_obj):
+                state.clipboard_object = copy_obj
+                self._show_status(state.tr.tr("copy_object"))
+
+            self._run_mesh_task(
+                "copy_object", lambda: copy.deepcopy(obj), copied,
+                obj.mesh.triangle_count,
+                busy=state.tr.tr("processing_mesh"),
+                actions=("copy_object", "paste_object"))
             return
         elif action == "save_stl":
             idx = state.scene.objects.index(obj)
@@ -3133,25 +4009,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.save_active_stl()
             return
         elif action == "repair":
-            info = obj.mesh.repair()
-            obj.invalidate_colors()
-            self.panel.refresh()
-            self.canvas.mark_dirty()
-            QtWidgets.QMessageBox.information(
-                self, state.tr.tr("repair_surface"),
-                f"weld_merged={info['weld_merged']}\n"
-                f"degenerate_removed={info['degenerate_removed']}\n"
-                f"triangles_flipped={info['triangles_flipped']}\n"
-                f"loose_removed={info['loose_removed']}\n"
-                f"before={info['before']} -> after={info['after']}")
+            def repaired(info):
+                obj.invalidate_colors()
+                self.panel.refresh()
+                self.canvas.mark_dirty()
+                QtWidgets.QMessageBox.information(
+                    self, state.tr.tr("repair_surface"),
+                    f"weld_merged={info['weld_merged']}\n"
+                    f"degenerate_removed={info['degenerate_removed']}\n"
+                    f"triangles_flipped={info['triangles_flipped']}\n"
+                    f"loose_removed={info['loose_removed']}\n"
+                    f"before={info['before']} -> after={info['after']}")
+
+            self._run_mesh_task("repair", obj.mesh.repair, repaired,
+                                obj.mesh.triangle_count,
+                                busy=state.tr.tr("processing_mesh"),
+                                actions=("statistics",))
             return
         elif action == "components":
-            parts = obj.mesh.split_components()
-            for part in parts:
-                state.scene.add_mesh(part, name=part.name, activate=False)
-            self.panel.refresh()
-            self.canvas.mark_dirty()
-            self._show_status(f"{state.tr.tr('generate_components')}: {len(parts)}")
+            def split_done(parts):
+                for part in parts:
+                    state.scene.add_mesh(part, name=part.name, activate=False)
+                self.panel.refresh()
+                self.canvas.mark_dirty()
+                self._show_status(
+                    f"{state.tr.tr('generate_components')}: {len(parts)}")
+
+            self._run_mesh_task("components", obj.mesh.split_components,
+                                split_done, obj.mesh.triangle_count,
+                                busy=state.tr.tr("processing_mesh"))
             return
         elif action == "remove_tri":
             others = [o for o in state.scene.objects if o is not obj]
@@ -3165,11 +4051,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if not ok:
                 return
             other = others[names.index(name)]
-            removed = obj.mesh.remove_triangles_intersecting(other.mesh)
-            obj.invalidate_colors()
-            self.panel.refresh()
-            self.canvas.mark_dirty()
-            self._show_status(f"removed triangles: {removed}")
+
+            def removed_done(removed):
+                obj.invalidate_colors()
+                self.panel.refresh()
+                self.canvas.mark_dirty()
+                self._show_status(f"removed triangles: {removed}")
+
+            self._run_mesh_task(
+                "remove_tri",
+                lambda: obj.mesh.remove_triangles_intersecting(other.mesh),
+                removed_done, obj.mesh.triangle_count,
+                busy=state.tr.tr("processing_mesh"))
             return
         elif action == "delete":
             idx = state.scene.objects.index(obj)
@@ -3184,20 +4077,34 @@ class MainWindow(QtWidgets.QMainWindow):
         obj = self.state.scene.active_object()
         if obj is None:
             return
-        self.state.clipboard_object = copy.deepcopy(obj)
-        self._show_status(self.state.tr.tr("copy_object"))
+
+        def done(copied):
+            self.state.clipboard_object = copied
+            self._show_status(self.state.tr.tr("copy_object"))
+
+        self._run_mesh_task("copy_object", lambda: copy.deepcopy(obj), done,
+                            obj.mesh.triangle_count,
+                            busy=self.state.tr.tr("processing_mesh"),
+                            actions=("copy_object", "paste_object"))
 
     def paste_object(self) -> None:
         src = self.state.clipboard_object
         if src is None:
             self._show_status(self.state.tr.tr("no_objects"))
             return
-        obj = Object3D(mesh=src.mesh.copy(), name=src.name + "_copy"
-                       if hasattr(src, "name") else "copy")
-        self.state.scene.objects.append(obj)
-        self.state.scene.set_active(len(self.state.scene.objects) - 1)
-        self.panel.refresh()
-        self.canvas.mark_dirty()
+
+        def done(mesh):
+            obj = Object3D(mesh=mesh, name=src.name + "_copy"
+                           if hasattr(src, "name") else "copy")
+            self.state.scene.objects.append(obj)
+            self.state.scene.set_active(len(self.state.scene.objects) - 1)
+            self.panel.refresh()
+            self.canvas.mark_dirty()
+
+        self._run_mesh_task("paste_object", src.mesh.copy, done,
+                            src.mesh.triangle_count,
+                            busy=self.state.tr.tr("processing_mesh"),
+                            actions=("copy_object", "paste_object"))
 
     def delete_object(self) -> None:
         idx = self.state.scene.active_index
@@ -3214,15 +4121,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_mesh_statistics(self, obj) -> None:
         # 深度统计对超大网格是 O(M log M) 且要十几秒；此时只给轻量统计，
-        # 避免点一下「Statistics」就把界面冻住。
-        deep = obj.mesh.triangle_count <= 200_000
-        text = obj.mesh.statistics(deep=deep).as_text()
-        if not deep:
-            text += "\n\n(大模型：已跳过连通分量/边界边等深度统计，避免界面卡顿)"
-        if obj.source_path and os.path.exists(obj.source_path):
-            report = stl_io.file_size_report(obj.source_path)
-            text += f"\n\n文件: {obj.source_path}\n大小: {report['human']}"
-        StatisticsDialog(text, self.state.tr.tr("statistics_title"), self).exec_()
+        # 并且整个统计放到后台，点一下菜单不会把界面冻住。
+        mesh = obj.mesh
+        source = obj.source_path
+        deep = mesh.triangle_count <= 200_000
+
+        def work():
+            text = mesh.statistics(deep=deep).as_text()
+            if not deep:
+                text += "\n\n(大模型：已跳过连通分量/边界边等深度统计，避免界面卡顿)"
+            if source and os.path.exists(source):
+                report = stl_io.file_size_report(source)
+                text += f"\n\n文件: {source}\n大小: {report['human']}"
+            return text
+
+        self._run_async(
+            "statistics", work,
+            lambda text: StatisticsDialog(
+                text, self.state.tr.tr("statistics_title"), self).exec_(),
+            busy=self.state.tr.tr("computing_statistics"),
+            actions=("statistics",))
 
     def show_statistics(self) -> None:
         obj = self.state.scene.active_object()
@@ -3241,6 +4159,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.refresh()
         self.canvas.mark_dirty()
         self.retranslate()
+        self.mcp.reload()
+        self._update_mcp_ui()
         self._show_status(self.state.tr.tr("settings_loaded", path))
 
     def save_default_settings(self) -> None:
@@ -3255,6 +4175,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.refresh()
         self.canvas.mark_dirty()
         self.retranslate()
+        self.mcp.reload()
+        self._update_mcp_ui()
 
     def show_about(self) -> None:
         tr = self.state.tr
@@ -3267,6 +4189,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- 关闭 ----------------
     def closeEvent(self, event) -> None:
+        # 先停掉内嵌 MCP 服务：窗口关了就不该继续接受 AI 的会话操作。
+        try:
+            self.mcp.stop()
+        except Exception:                                    # noqa: BLE001
+            pass
+        # 再把后台任务收干净：正在写盘的图片 / STL 不能因为关窗口被截断。
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                if self._work_pool.activeThreadCount() <= 0:
+                    break
+            except Exception:
+                break
+            time.sleep(0.02)
+        self._work_pool.clear()
+        try:
+            self._work_bridge.finished.disconnect(self._on_work_finished)
+        except Exception:
+            pass
         self.canvas.shutdown()
         try:
             self.state.save_settings()

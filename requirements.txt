@@ -7,3 +7,7 @@ numpy>=1.22
 
 # 可选：图形界面（无它时仍可使用命令行模式）
 PyQt5>=5.15
+
+# 可选：官方 MCP SDK（只有独立进程的 stl_viewer/mcp_fastmcp.py 入口需要）
+# GUI 内嵌 HTTP 服务与零依赖 stl_viewer/mcp_stdio.py 只用标准库，无需安装下面这一行。
+# pip install "mcp>=1.2"

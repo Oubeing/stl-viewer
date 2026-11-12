@@ -1,4 +1,4 @@
-"""轨道相机 —— View 菜单（Zoom / Rotate around Z / Rotation Angles /
+"""轨道相机 —— View 菜单（Zoom / 旋转轴 X·Y·Z·视线 / Rotation Angles /
 Orthogonal / Reset center / Change center / Fixed on screen）。
 
 世界坐标：Z 为刀具回转轴，Z 向上。
@@ -7,6 +7,8 @@ Orthogonal / Reset center / Change center / Fixed on screen）。
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -173,8 +175,9 @@ class Camera:
     # 轨道相机的 target 就是「视图支点」：look_at(eye, target, up) 保证它
     # 恒投影在画布正中心。旋转只改变 eye 方向、缩放只改变 distance /
     # ortho_height，两者都天然以画布中心为原点；平移把支点连同模型一起移动，
-    # 平移结束后支点依旧落在画布中心。GUI 统一调用下面三个 *_about_center
-    # 包装方法，避免再出现「绕世界原点或某个模型点转」的偏移支点。
+    # 平移结束后支点依旧落在画布中心。下面三个 *_about_center 包装方法保留给
+    # 菜单 / 键盘 / CLI 等调用方；GUI 的拖拽交互改走 navigation.py（光标锚点
+    # 缩放与抓取式平移），两者共用同一套投影口径，不会绕世界原点转。
     @property
     def pivot(self) -> np.ndarray:
         """视图支点（世界坐标），恒位于画布中心。"""
@@ -201,7 +204,33 @@ class Camera:
     def rotate_around_z(self, dx_pixels: float, speed: float | None = None) -> None:
         """Rotate around Z：只改变方位角（沿机床回转轴转）。"""
         speed = self.ROTATE_SPEED if speed is None else float(speed)
-        self.yaw -= dx_pixels * speed
+        self.rotate_about_axis(-dx_pixels * speed, "z")
+
+    def rotate_about_axis(self, degrees: float, axis: str = "z") -> None:
+        """绕指定世界坐标轴（X / Y / Z）或视线轴旋转视角。
+
+        ``z`` 走 yaw 快路径（与旧行为完全一致）；``x`` / ``y`` / ``view``
+        把相机朝向绕世界轴旋转后用 ``set_orientation`` 反解 yaw/pitch/roll，
+        因此投影、拾取、射线等所有下游代码无需改动。鼠标拖拽、键盘步进、
+        旋转动画共用这一入口，三个轴的旋转手感保持一致。
+        """
+        deg = float(degrees)
+        if abs(deg) < 1e-12:
+            return
+        key = str(axis).lower()
+        if key == "z":
+            self.yaw += deg
+            return
+        if key == "x":
+            direction = np.array([1.0, 0.0, 0.0])
+        elif key == "y":
+            direction = np.array([0.0, 1.0, 0.0])
+        elif key == "view":
+            direction = self.forward()
+        else:
+            return
+        rot = mu.rotation_matrix(direction, np.radians(deg))
+        self.set_orientation(rot @ self.offset_vector(), rot @ self.up())
 
     def set_rotation_angles(self, yaw=None, pitch=None, roll=None) -> None:
         if yaw is not None:
@@ -242,15 +271,12 @@ class Camera:
         """缩放：默认以画布中心为锚点（支点不动）。
 
         ``anchor=(x, y)`` 时改为以该屏幕点为锚点，缩放后补偿 target，
-        使锚点下的世界点保持不动。查看器默认不用这个分支，因为视图操作
-        统一要求以画布中心为原点。
+        使锚点下的世界点保持不动（CAD 软件的 zoom-to-cursor）。
         """
-        before = self.ray_to_plane(*anchor) if anchor is not None else None
-        self.dolly(steps, rate)
-        if before is not None:
-            after = self.ray_to_plane(*anchor)
-            if after is not None:
-                self.target = self.target + (before - after)
+        if anchor is not None:
+            self.dolly_at(anchor[0], anchor[1], steps, rate)
+        else:
+            self.dolly(steps, rate)
 
     def zoom_by_factor(self, factor: float) -> None:
         self.zoom = float(np.clip(self.zoom * factor, 0.01, 100.0))
@@ -354,7 +380,12 @@ class Camera:
         if self.orthographic:
             h = self.visible_height() * 0.5
             w = h * self.aspect
-            origin = self.target + self.right() * ndc_x * w + self.up() * ndc_y * h
+            # 起点必须放在相机所在的近端平面，而不是过支点的平面：
+            # 支点可能落在实体内部（例如俯视一个带凸台的零件），从支点
+            # 向里发射线只能打到后半部分，拾取到的深度就是错的（顶面
+            # 会被当成底面）。沿视线平移起点不改变射线所在的直线，
+            # 平面投影 / 缩放锚点等行为完全不变。
+            origin = self.eye() + self.right() * ndc_x * w + self.up() * ndc_y * h
             return origin, self.forward()
         tan_half = self.tan_half_fov()
         direction = mu.normalize(
@@ -376,6 +407,132 @@ class Camera:
                                         np.asarray(plane_point, dtype=np.float64),
                                         mu.normalize(np.asarray(plane_normal, dtype=np.float64)))
         return hit if hit is not None else self.target.copy()
+
+    # ---------------- CAD 风格导航用的低层运算 ----------------
+    # 这一组方法是 navigation.py 的基础。它们只改 target / yaw / pitch /
+    # roll / distance / ortho_height，不改变任何既有 API 的语义，因此
+    # 投影、拾取、fit、动画与导出逻辑完全不受影响。
+    def _base_up(self, forward: np.ndarray) -> np.ndarray:
+        """与 :meth:`up` 完全一致的「无滚转」基准上方向。"""
+        up = WORLD_UP if abs(float(np.dot(forward, WORLD_UP))) <= 0.9999 \
+            else np.array([0.0, 1.0, 0.0])
+        return mu.normalize(up - forward * float(np.dot(up, forward)))
+
+    def set_orientation(self, back, up) -> None:
+        """由一对正交的世界方向反解 yaw / pitch / roll。
+
+        轨迹球旋转会越过极点并产生滚转，此时用「绕世界 Z 的方位角 + 俯仰角」
+        已无法表达朝向；这里把任意朝向投影回既有的 yaw/pitch/roll 参数化，
+        使 :meth:`up`、:meth:`right`、:meth:`view_matrix`、:meth:`ray` 等
+        全部继续工作，无需改动渲染与拾取代码。
+        """
+        b = mu.normalize(np.asarray(back, dtype=np.float64))
+        f = -b
+        if float(np.linalg.norm(b)) < 1e-9:
+            return
+        base_up = self._base_up(f)
+        base_right = mu.normalize(np.cross(f, base_up))
+        u = np.asarray(up, dtype=np.float64)
+        u = mu.normalize(u - f * float(np.dot(u, f)))
+        if float(np.linalg.norm(u)) < 1e-9:
+            u = base_up
+        # up() = R(forward, roll) @ base_up；R 的一阶项为 forward × base_up
+        # = base_right，所以 atan2 恰好还原 roll（符号与 up() 一致）。
+        roll = np.degrees(np.arctan2(float(np.dot(u, base_right)),
+                                    float(np.dot(u, base_up))))
+        self.pitch = float(np.clip(np.degrees(np.arcsin(np.clip(b[2], -1.0, 1.0))),
+                                   -89.99, 89.99))
+        self.yaw = float(np.degrees(np.arctan2(b[1], b[0])))
+        self.roll = float(roll)
+
+    def _arcball_vector(self, x: float, y: float) -> np.ndarray:
+        """屏幕点 -> 单位球面向量（相机空间：right / up / 指向观察者）。"""
+        r = max(min(self.width, self.height), 1) * 0.5
+        nx = (float(x) - self.width * 0.5) / r
+        # y 与屏幕同向（向下为正）：与转台式旋转的「向右拖 yaw 减小、
+        # 向下拖 pitch 减小」保持同一跟手方向。
+        ny = (float(y) - self.height * 0.5) / r
+        d2 = nx * nx + ny * ny
+        if d2 <= 1.0:
+            nz = math.sqrt(max(0.0, 1.0 - d2))
+        else:
+            d = math.sqrt(d2)
+            nx, ny, nz = nx / d, ny / d, 0.0
+        return np.array([nx, ny, nz], dtype=np.float64)
+
+    def rotate_arcball(self, x0: float, y0: float, x1: float, y1: float,
+                       speed: float | None = None) -> None:
+        """自由轨迹球旋转（CATIA 式）：可越过极点、可产生滚转。
+
+        旋转轴来自球面上起点→终点的叉积，因此越靠近画布边缘拖动，滚转越
+        明显；绕极点时不会像转台式相机那样「卡住」。旋转量仍以
+        ``度/像素`` 计，保持与设置里的旋转灵敏度严格成正比。
+        """
+        speed = self.ROTATE_SPEED if speed is None else float(speed)
+        dx, dy = float(x1) - float(x0), float(y1) - float(y0)
+        dist = math.hypot(dx, dy)
+        if dist < 1e-9:
+            return
+        v0 = self._arcball_vector(x0, y0)
+        v1 = self._arcball_vector(x1, y1)
+        axis_c = np.cross(v0, v1)
+        if float(np.linalg.norm(axis_c)) < 1e-9:
+            return
+        # 相机空间基的行向量：[right, up, back]
+        basis = np.stack([self.right(), self.up(), self.offset_vector()])
+        axis_w = mu.normalize(axis_c @ basis)
+        # 与转台式旋转保持同一手感：向右拖时 yaw 减小、向下拖时 pitch 减小。
+        angle = np.radians(-dist * speed)
+        rot = mu.rotation_matrix(axis_w, float(angle))
+        back = self.offset_vector()
+        up = self.up()
+        self.set_orientation(rot @ back, rot @ up)
+
+    def dolly_at(self, x: float, y: float, steps: float,
+                 rate: float | None = None, plane_point=None) -> None:
+        """以指定屏幕点为锚点缩放：缩放前后该点下的世界点保持不动。
+
+        旧 ``dolly_about_center(anchor=...)`` 在 dolly 之后重新取 ``target``
+        作为参考平面，而 target 已被补偿改动，两次射线落在了不同的平面上，
+        补偿量因此偏差。这里把平面点与法向固定下来再求交，透视与正交都精确。
+        """
+        p0 = (self.target.copy() if plane_point is None
+              else np.asarray(plane_point, dtype=np.float64))
+        n0 = self.forward().copy()
+        before = mu.ray_plane_intersection(*self.ray(x, y), p0, n0)
+        self.dolly(steps, rate)
+        if before is None:
+            return
+        after = mu.ray_plane_intersection(*self.ray(x, y), p0, n0)
+        if after is not None:
+            self.target = self.target + (before - after)
+
+    def pan_grab(self, x: float, y: float, plane_point=None) -> tuple:
+        """开始抓取式平移，返回不随视图变化的参考系 (世界点, 平面点, 法向)。
+
+        CAD 软件的平移手感来自「抓住光标下的那个点」：拖动过程中该点始终
+        贴在光标上，透视下近处/远处的模型也不会漂。
+        """
+        p0 = (self.target.copy() if plane_point is None
+              else np.asarray(plane_point, dtype=np.float64))
+        n0 = self.forward().copy()
+        hit = mu.ray_plane_intersection(*self.ray(x, y), p0, n0)
+        world = p0.copy() if hit is None else np.asarray(hit, dtype=np.float64)
+        return world, p0, n0
+
+    def pan_drag_to(self, x: float, y: float, grab: tuple,
+                    factor: float = 1.0) -> None:
+        """把 :meth:`pan_grab` 抓住的点移动到当前光标位置。"""
+        world, p0, n0 = grab
+        hit = mu.ray_plane_intersection(*self.ray(x, y), p0, n0)
+        if hit is None:
+            return
+        delta = (world - np.asarray(hit, dtype=np.float64)) * float(factor)
+        self.target = self.target + delta
+
+    def reframe(self, point) -> None:
+        """把指定世界点移到画布中心，作为新的旋转支点（Center on point）。"""
+        self.target = np.asarray(point, dtype=np.float64).reshape(3).copy()
 
     # ---------------- 序列化 ----------------
     def state(self) -> dict:

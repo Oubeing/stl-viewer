@@ -103,8 +103,10 @@ def main() -> int:
     cam = state.camera
     pending = state.measures.pending
     center = pending.points[0]
-    p_small, _ = canvas._measure_point_at(cx + 60, cy, pending)
-    p_large, _ = canvas._measure_point_at(cx + 140, cy, pending)
+    # _measure_point_at 返回 (view_point, surface_point, plane_point, normal)；
+    # 测量平面点与预览半径都用 view_point，和当前 CAD 投影口径一致。
+    p_small = canvas._measure_point_at(cx + 60, cy, pending)[0]
+    p_large = canvas._measure_point_at(cx + 140, cy, pending)[0]
     r_small = float(np.linalg.norm(p_small - center))
     r_large = float(np.linalg.norm(p_large - center))
     check("半径随光标位置变化", r_large > r_small > 0,
@@ -113,7 +115,7 @@ def main() -> int:
           f"ratio={r_large / max(r_small, 1e-9):.3f}")
 
     # 预览与最终结果必须一致：先在目标像素处算一次期望值，再点下去
-    rim_pt, _ = canvas._measure_point_at(cx + 145, cy + 5, pending)
+    rim_pt = canvas._measure_point_at(cx + 145, cy + 5, pending)[0]
     click(cx + 140, cy, jitter=5)                   # 手抖着点圆周点
     check("手抖点击也能完成圆", len(state.measures.items) == 1,
           state.measures.items[-1].value_text(state.units)

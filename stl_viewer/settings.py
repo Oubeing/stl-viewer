@@ -14,6 +14,7 @@ from typing import Any
 
 from .camera import Camera
 from .lighting import LightSettings
+from .mcp_config import MCPSettings
 from .scene import Scene
 
 APP_NAME = "STL Viewer"
@@ -163,6 +164,19 @@ class AppSettings:
     rotate_speed: float = 0.12           # 轨道旋转：度 / 像素
     pan_speed: float = 1.0               # 平移：1.0 表示模型严格跟随光标
     zoom_speed: float = 0.07             # 滚轮缩放：每档的指数系数
+    # ---- CAD 风格视图导航 ----
+    # style: classic(原行为) / cad(默认) / catia / solidworks
+    # rotate_mode: turntable(Z 朝上) / arcball(自由轨迹球，可越过极点)
+    # zoom_anchor: cursor(缩放时保持光标下的点不动) / center
+    # pivot: center(绕画布中心) / cursor(绕按下点旋转)
+    nav_style: str = "cad"
+    nav_rotate_mode: str = "turntable"
+    nav_zoom_anchor: str = "cursor"
+    nav_pivot: str = "center"
+    nav_inertia: bool = False            # 释放后短暂惯性旋转
+    # 长度测量口径：view = 视图投影（默认，CAD 的「在视图里量」）；
+    # 3d = 真实三维距离（适合在轴测视图里点真实表面点）。
+    measure_mode: str = "view"
     auto_fit_views: bool = True          # 切换标准视图时自动 Zoom Fit
     use_opengl: bool = True              # 硬件视口（不可用时自动回退软件渲染）
     view: ViewOptions = field(default_factory=ViewOptions)
@@ -170,6 +184,8 @@ class AppSettings:
     light: dict = field(default_factory=dict)
     default_directory: str = ""
     recent_files: list = field(default_factory=list)
+    #: 内嵌 MCP 服务的启用状态与全部参数（Extras → MCP Service Settings）
+    mcp: MCPSettings = field(default_factory=MCPSettings)
 
     # ---------------- 路径 ----------------
     @staticmethod
@@ -198,6 +214,12 @@ class AppSettings:
             "RotateSpeed": str(self.rotate_speed),
             "PanSpeed": str(self.pan_speed),
             "ZoomSpeed": str(self.zoom_speed),
+            "NavStyle": self.nav_style,
+            "NavRotateMode": self.nav_rotate_mode,
+            "NavZoomAnchor": self.nav_zoom_anchor,
+            "NavPivot": self.nav_pivot,
+            "NavInertia": str(self.nav_inertia),
+            "MeasureMode": self.measure_mode,
             "AutoFitViews": str(self.auto_fit_views),
             "UseOpenGL": str(self.use_opengl),
             "DefaultDirectory": self.default_directory,
@@ -210,6 +232,7 @@ class AppSettings:
             "WireColor": _to_str(self.wire_color),
         }
         cp["Recent"] = {f"File{i}": p for i, p in enumerate(self.recent_files[:10])}
+        cp["MCP"] = {k: _to_str(v) for k, v in self.mcp.state().items()}
         with open(path, "w", encoding="utf-8") as fh:
             cp.write(fh)
         return path
@@ -242,6 +265,12 @@ class AppSettings:
         self.rotate_speed = _to_float(g.get("RotateSpeed"), self.rotate_speed)
         self.pan_speed = _to_float(g.get("PanSpeed"), self.pan_speed)
         self.zoom_speed = _to_float(g.get("ZoomSpeed"), self.zoom_speed)
+        self.nav_style = g.get("NavStyle", self.nav_style)
+        self.nav_rotate_mode = g.get("NavRotateMode", self.nav_rotate_mode)
+        self.nav_zoom_anchor = g.get("NavZoomAnchor", self.nav_zoom_anchor)
+        self.nav_pivot = g.get("NavPivot", self.nav_pivot)
+        self.nav_inertia = _to_bool(g.get("NavInertia"), self.nav_inertia)
+        self.measure_mode = g.get("MeasureMode", self.measure_mode)
         self.auto_fit_views = _to_bool(g.get("AutoFitViews"), self.auto_fit_views)
         self.use_opengl = _to_bool(g.get("UseOpenGL"), self.use_opengl)
         self.default_directory = g.get("DefaultDirectory", self.default_directory)
@@ -257,6 +286,8 @@ class AppSettings:
             self.wire_color = tuple(_parse_list(cp["Colors"].get("WireColor"), self.wire_color))
         if "Recent" in cp:
             self.recent_files = [v for k, v in cp["Recent"].items() if v]
+        if "MCP" in cp:
+            self.mcp.set_state(dict(cp["MCP"]))
         return self
 
     def reset_to_factory(self) -> None:
